@@ -2,12 +2,13 @@ import sys
 print("Python executable:", sys.executable)
 print("Python version:", sys.version)
 
+import os
+import random
 import numpy as np
 import pywt
 import matplotlib.pyplot as plt
 from skimage import io, img_as_float, color
 from skimage.metrics import mean_squared_error, peak_signal_noise_ratio
-import os
 from concurrent.futures import ThreadPoolExecutor
 
 # ---------------- Dataset Creation ---------------- #
@@ -63,16 +64,7 @@ def load_and_match_shapes(original_path, masked_path):
     original = original[:h, :w]
     masked = masked[:h, :w]
 
-    # If RGB, crop each channel to the same size
-    if original.ndim == 3 and masked.ndim == 3:
-        channels = original.shape[2]
-        h = min(original.shape[0], masked.shape[0])
-        w = min(original.shape[1], masked.shape[1])
-        original = original[:h, :w, :channels]
-        masked = masked[:h, :w, :channels]
-
     return original, masked
-
 
 # ---------------- Wavelet Functions ---------------- #
 
@@ -94,7 +86,7 @@ def array_to_coeffs(arr, slices):
 def sparse_reconstruct_ista(measurements, mask, wavelet='db1', level=2, n_iter=50, lam=0.1, step=1.0):
     x = np.copy(measurements)
     mask = mask.astype(float)
-    for i in range(n_iter):
+    for _ in range(n_iter):
         x = x + mask * (measurements - x)
         coeffs = wavelet_decompose(x, wavelet, level)
         arr, slices = coeffs_to_array(coeffs)
@@ -126,7 +118,7 @@ def reconstruct_channels(masked, wavelet='db1', level=2, n_iter=50, lam=0.1, ste
 
 # ---------------- Main Processing Function ---------------- #
 
-def process_image(original_path="original.npy", masked_path="sampled.npy",
+def process_image(original_path="dataset/original.npy", masked_path="dataset/sampled.npy",
                   wavelet='db1', level=2, n_iter=50, lam=0.1, step=1.0, show=False):
     original, masked = load_and_match_shapes(original_path, masked_path)
     reconstructed_img = reconstruct_channels(masked, wavelet, level, n_iter, lam, step)
@@ -145,62 +137,86 @@ def process_image(original_path="original.npy", masked_path="sampled.npy",
 
 # ---------------- Stochastic Auto-Tuning ---------------- #
 
-def stochastic_auto_tune(image_path, out_dir="dataset", sample_fraction=0.4,
-                         initial_params=None, n_trials=50, noise_scale=None, grayscale=True):
+def stochastic_auto_tune(image_path, out_dir="dataset", sample_fraction=0.4, grayscale=True,
+                         initial_params=None, n_trials=50):
     # Always remake dataset
-    make_dataset(image_path, out_dir, sample_fraction, seed=42, grayscale=grayscale)
+    make_dataset(image_path, out_dir=out_dir, sample_fraction=sample_fraction, grayscale=grayscale)
     original_path = os.path.join(out_dir, "original.npy")
     masked_path = os.path.join(out_dir, "sampled.npy")
 
-    if initial_params is None:
-        initial_params = {'wavelet':'db1','level':2,'n_iter':20,'lam':0.1,'step':1.0}
-    if noise_scale is None:
-        noise_scale = {'level':1,'n_iter':10,'lam':0.05,'step':0.5}
+    best_mse = float('inf')
+    best_psnr = float('-inf')  # Track PSNR corresponding to best MSE
+    best_result = None
+    best_params = None
 
-    wavelets = ['db1','db2','sym2','coif1']
-    best_params = initial_params.copy()
-    best_img, best_mse, best_psnr = process_image(original_path, masked_path, **best_params, show=False)
+    for i in range(n_trials):
+        if initial_params:
+            candidate_params = {
+                "wavelet": random.choice(["db1", "db2", "haar", "sym2"]),
+                "level": max(1, initial_params["level"] + random.randint(-1, 1)),
+                "n_iter": max(10, initial_params["n_iter"] + random.randint(-20, 20)),
+                "lam": max(1e-4, initial_params["lam"] + random.uniform(-0.01, 0.01)),
+                "step": max(0.05, initial_params["step"] + random.uniform(-0.2, 0.2)),
+            }
+        else:
+            candidate_params = {
+                "wavelet": random.choice(["db1", "db2", "haar", "sym2"]),
+                "level": random.randint(1, 4),
+                "n_iter": random.randint(50, 200),
+                "lam": random.uniform(0.001, 0.1),
+                "step": random.uniform(0.1, 2.0),
+            }
 
-    for trial in range(n_trials):
-        # Random offset from current best
-        level = max(1, best_params['level'] + np.random.randint(-noise_scale['level'], noise_scale['level']+1))
-        n_iter = max(1, best_params['n_iter'] + np.random.randint(-noise_scale['n_iter'], noise_scale['n_iter']+1))
-        lam = max(0.001, best_params['lam'] + np.random.uniform(-noise_scale['lam'], noise_scale['lam']))
-        step = max(0.1, best_params['step'] + np.random.uniform(-noise_scale['step'], noise_scale['step']))
-        wavelet = np.random.choice(wavelets)
+        try:
+            img, mse, psnr = process_image(original_path, masked_path, **candidate_params, show=False)
 
-        candidate_params = {'wavelet':wavelet,'level':level,'n_iter':n_iter,'lam':lam,'step':step}
-        img, mse, psnr = process_image(original_path, masked_path, **candidate_params, show=False)
+            print(f"Trial {i+1}/{n_trials}: MSE={mse:.4f}, PSNR={psnr:.2f} dB, params={candidate_params}")
 
-        if mse < best_mse:
-            best_img = img
-            best_mse = mse
-            best_psnr = psnr
-            best_params = candidate_params.copy()
-            print(f"Trial {trial+1}: New best! MSE={best_mse:.6f}, PSNR={best_psnr:.2f} | Params={best_params}")
+            if mse < best_mse:
+                best_mse = mse
+                best_psnr = psnr
+                best_result = img
+                best_params = candidate_params
 
-    print("\n=== Best Parameters Found ===")
-    for k,v in best_params.items():
-        print(f"{k} = {v}")
-    print(f"MSE={best_mse:.6f}, PSNR={best_psnr:.2f}")
+        except Exception as e:
+            print(f"Trial {i+1}/{n_trials} failed with error: {e}")
 
-    plt.figure(figsize=(6,6))
-    plt.imshow(best_img, cmap='gray' if best_img.ndim==2 else None)
-    plt.title("Best Stochastic Reconstruction")
-    plt.axis('off')
-    plt.show()
+    if best_result is not None:
+        print("\nBest Parameters Found:")
+        print(best_params)
+        print(f"Best MSE={best_mse:.4f}")
+        print(f"PSNR at Best MSE={best_psnr:.2f} dB")  # <-- Added PSNR reporting
 
-    return best_img, best_params
+        # Load original for display
+        original = np.load(original_path)
+
+        # Ensure values are in [0,1]
+        original_disp = np.clip(original, 0, 1)
+        best_disp = np.clip(best_result, 0, 1)
+
+        # Show the final result side by side
+        fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+        axes[0].imshow(original_disp, cmap='gray' if original_disp.ndim==2 else None)
+        axes[0].set_title("Original")
+        axes[0].axis("off")
+
+        axes[1].imshow(best_disp, cmap='gray' if best_disp.ndim==2 else None)
+        axes[1].set_title("Best Reconstructed")
+        axes[1].axis("off")
+
+        plt.tight_layout()
+        plt.show()
+    else:
+        print("No successful reconstructions.")
 
 # ---------------- Run Example ---------------- #
 
 if __name__ == "__main__":
-    # 1. Run stochastic auto-tune on your image
     stochastic_auto_tune(
-        image_path="3.3MP_FLWR GRY.png",
+        image_path="1MP GRY.png",
         out_dir="dataset",
         sample_fraction=0.4,
-        initial_params={'wavelet':'coif1','level':7,'n_iter':58,'lam':0.0681,'step':1.35},
-        n_trials=50,
-        grayscale=True
+        grayscale=True,
+        initial_params={'wavelet':'sym2','level':7,'n_iter':67,'lam':0.06516217782694049,'step':1.2936710717113946},
+        n_trials=50
     )
