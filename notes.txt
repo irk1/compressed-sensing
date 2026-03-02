@@ -1,0 +1,3 @@
+have it generate the dataset by specifying a random collection of pixels where avg difference is no greater then x pixels
+have program find probable pixel between any 2 adjacent pixels (use usaf photo resolution thingy) compare to finding an avg value between any 2 adjacent pixels
+  

@@ -6,6 +6,7 @@ import os
 import math
 import random
 import numpy as np
+import gc
 import pywt
 import matplotlib.pyplot as plt
 from skimage import io, img_as_float, color
@@ -17,15 +18,17 @@ from concurrent.futures import ThreadPoolExecutor
 
 
 # ---------------- CONFIGURATION BLOCK ---------------- #
+# ---------------- CONFIGURATION BLOCK ---------------- #
 CONFIG = {
     # Paths
     "image_path": "4MP_FLWR GRY.png",
     "out_dir": "dataset",
 
     # Dataset creation
-    "sample_fraction": 0.3,
+    "sample_fraction": 1.0,  # 1.0 = every pixel at the 'spacing' interval is kept
+    "scale_factor": 2,       # New: Spacing/Upscale factor
     "grayscale": True,
-    "seed": 42,  # random seed for reproducibility
+    "seed": 42,
 
     # Auto-tune / reconstruction
     "initial_guess": {
@@ -40,7 +43,7 @@ CONFIG = {
     },
 
     # Successive halving parameters
-    "budget_schedule": (30, 80, 160),  # maps to n_iter for trials
+    "budget_schedule": (30, 80, 160),
     "pool_size": 2,
     "topk_ratio": 0.3,
     "anneal": True,
@@ -50,36 +53,62 @@ CONFIG = {
     "show_images": True,
 
     # Parallelization
-    "max_threads": 8,  # limit ThreadPoolExecutor if desired
+    "max_threads": 8,
 }
-# ---------------- END CONFIGURATION ---------------- #
+# ---------------- END CONFIGURATION ---------------- ## ---------------- END CONFIGURATION ---------------- #
 
 # ---------------- Dataset Creation ---------------- #
 
-def make_dataset(image_path, out_dir="dataset", sample_fraction=0.4, seed=42, grayscale=True):
+def make_dataset(image_path, out_dir="dataset", sample_fraction=0.3, seed=42, grayscale=True, scale_factor=2):
+    """
+    Modified for Super-Resolution: 
+    - Spaces out pixels on a grid scale_factor times larger.
+    - Saves high-res ground truth to 'original.npy'.
+    - Saves the 'spaced out' grid to 'sampled.npy'.
+    """
     np.random.seed(seed)
-    img = img_as_float(io.imread(image_path))
+    # Load the low-res source
+    img_lr = img_as_float(io.imread(image_path))
     
-    # Convert to grayscale if requested
-    if grayscale and img.ndim == 3:
-        if img.shape[2] == 4:  # RGBA
-            img = img[..., :3]
-        img = color.rgb2gray(img)[..., np.newaxis]
+    if grayscale and img_lr.ndim == 3:
+        if img_lr.shape[2] == 4: img_lr = img_lr[..., :3]
+        img_lr = color.rgb2gray(img_lr)[..., np.newaxis]
 
-    h, w = img.shape[:2]
-    total_pixels = h * w
-    mask = np.zeros((h, w), dtype=bool)
-    num_samples = int(total_pixels * sample_fraction)
-    coords = np.random.choice(total_pixels, num_samples, replace=False)
-    mask.flat[coords] = True
+    h_lr, w_lr = img_lr.shape[:2]
+    h_hr, w_hr = h_lr * scale_factor, w_lr * scale_factor
+    
+    # 1. Create the 'Original' (High-Res Ground Truth for scoring)
+    # We use a basic resize here just so the 'original' exists at the correct size
+    from skimage.transform import resize
+    img = resize(img_lr, (h_hr, w_hr), order=3, anti_aliasing=True)
+
+    # 2. Create the 'Sampled' (Spaced out pixels on HR grid)
     sampled_img = np.zeros_like(img)
-    sampled_img[mask] = img[mask]
+    
+    # Map pixels from LR to HR grid at specific intervals (The "Spaced Out" logic)
+    # This places the original pixels as anchors in the larger image
+    sampled_img[::scale_factor, ::scale_factor] = img_lr
+    
+    # 3. Apply sample_fraction if you want to drop some of those anchors randomly
+    if sample_fraction < 1.0:
+        mask = np.zeros((h_hr, w_hr), dtype=bool)
+        mask[::scale_factor, ::scale_factor] = True
+        active_coords = np.argwhere(mask)
+        num_to_keep = int(len(active_coords) * sample_fraction)
+        keep_idx = np.random.choice(len(active_coords), num_to_keep, replace=False)
+        
+        # Reset sampled_img and only put back the chosen fraction
+        final_sampled = np.zeros_like(sampled_img)
+        for i in keep_idx:
+            r, c = active_coords[i]
+            final_sampled[r, c] = sampled_img[r, c]
+        sampled_img = final_sampled
 
+    # --- SAVE LOGIC (Identical names to your current code) ---
     os.makedirs(out_dir, exist_ok=True)
     np.save(os.path.join(out_dir, "original.npy"), img)
     np.save(os.path.join(out_dir, "sampled.npy"), sampled_img)
 
-    # Save previews exactly as generated
     if grayscale:
         io.imsave(os.path.join(out_dir, "original.png"), (img.squeeze() * 255).astype(np.uint8))
         io.imsave(os.path.join(out_dir, "sampled.png"), (sampled_img.squeeze() * 255).astype(np.uint8))
@@ -87,7 +116,7 @@ def make_dataset(image_path, out_dir="dataset", sample_fraction=0.4, seed=42, gr
         io.imsave(os.path.join(out_dir, "original.png"), (img * 255).astype(np.uint8))
         io.imsave(os.path.join(out_dir, "sampled.png"), (sampled_img * 255).astype(np.uint8))
 
-    print(f"Dataset created in '{out_dir}'.")
+    print(f"SR Dataset created: {h_lr}x{w_lr} -> {h_hr}x{w_hr} (Scale: {scale_factor}x)")
 
 # ---------------- Load and Match Shapes ---------------- #
 
@@ -441,11 +470,18 @@ def successive_halving(image_paths, budget_schedule=(20, 60, 140), pool_size=24,
     return best_tuple  # (img, mse, psnr, ssim, params)
 
 # ---------------- High-level Auto-Tune ---------------- #
+# ---------------- High-level Auto-Tune ---------------- #
 
 def stochastic_auto_tune(image_path, out_dir="dataset", sample_fraction=0.4, grayscale=True,
-                         initial_params=None, n_trials=50):
-    # Always remake dataset
-    make_dataset(image_path, out_dir=out_dir, sample_fraction=sample_fraction, grayscale=grayscale)
+                         initial_params=None, scale_factor=2):
+    """
+    Variables remain identical. 
+    Added scale_factor to trigger 'spaced out' pixel mapping.
+    """
+    # Always remake dataset with the new spacing/scale logic
+    make_dataset(image_path, out_dir=out_dir, sample_fraction=sample_fraction, 
+                 grayscale=grayscale, scale_factor=scale_factor)
+    
     original_path = os.path.join(out_dir, "original.npy")
     masked_path = os.path.join(out_dir, "sampled.npy")
 
@@ -457,30 +493,29 @@ def stochastic_auto_tune(image_path, out_dir="dataset", sample_fraction=0.4, gra
         seed_pool.append({'algo': algo, **p})
 
     # Run Successive Halving (+ anneal) across algorithms/params
+    # Variables for budget and pool are pulled from CONFIG inside the main block or passed here
     best_img, best_mse, best_psnr, best_ssim, best_params = successive_halving(
         (original_path, masked_path),
         pool_size=CONFIG["pool_size"],
         budget_schedule=CONFIG["budget_schedule"],
         topk_ratio=CONFIG["topk_ratio"],
         anneal=CONFIG["anneal"],
-        T0=CONFIG["T0"]
+        T0=CONFIG["T0"],
+        initial_params=initial_params # Ensure this is passed to respect your "No-Jitter" rule
     )
 
     if best_img is not None:
         print("\n=== Best Parameters Found ===")
 
-    # Make a full template with all possible keys
+        # Make a full template with all possible keys
         full_template = CONFIG["initial_guess"].copy()
-    # Merge algorithm-specific defaults for other algos
         algo_defaults = {
             'ista': {'wavelet':'db1','level':2,'n_iter':100,'lam':0.05,'step':1.0,'cont_decay':0.95,'cont_every':10},
             'fista': {'wavelet':'db1','level':2,'n_iter':100,'lam':0.05,'step':1.0,'cont_decay':0.95,'cont_every':10},
             'reweighted': {'wavelet':'db1','level':2,'n_outer':3,'n_iter':40,'lam':0.05,'step':1.0},
             'tv_admm': {'lam_tv':0.1,'rho':0.5,'n_iter':100}
         }
-    # Update template with algo-specific defaults
         full_template.update(algo_defaults.get(best_params['algo'], {}))
-    # Overwrite with best_params
         full_template.update(best_params)
 
         print(full_template)
@@ -495,14 +530,14 @@ def stochastic_auto_tune(image_path, out_dir="dataset", sample_fraction=0.4, gra
         sampled_disp = io.imread(sampled_img_path)
         best_disp = np.clip(best_img, 0, 1)
 
-        # Show original, sampled, and reconstructed images side by side
+        # Show side by side
         fig, axes = plt.subplots(1, 3, figsize=(18, 6))
         axes[0].imshow(original_disp, cmap='gray' if original_disp.ndim==2 else None)
-        axes[0].set_title("Original")
+        axes[0].set_title("Original (HR Target)")
         axes[0].axis("off")
 
         axes[1].imshow(sampled_disp, cmap='gray' if sampled_disp.ndim==2 else None)
-        axes[1].set_title("Sampled")
+        axes[1].set_title("Sampled (Spaced Out)")
         axes[1].axis("off")
 
         axes[2].imshow(best_disp, cmap='gray' if best_disp.ndim==2 else None)
@@ -513,27 +548,16 @@ def stochastic_auto_tune(image_path, out_dir="dataset", sample_fraction=0.4, gra
         plt.show()
     else:
         print("No successful reconstructions.")
-
 # ---------------- Run Example ---------------- #
 
-if __name__ == "__main__":
-    # Example: you can include an initial guess (algo optional)
-    initial_guess = {
-        'algo': 'tv_admm',
-        'wavelet': 'db2',
-        'level': 5,
-        'n_iter': 100,
-        'lam': 0.05,
-        'step': 1.2,
-        'cont_decay': 0.95,
-        'cont_every': 10,
-    }
 
+
+if __name__ == "__main__":
     stochastic_auto_tune(
         image_path=CONFIG["image_path"],
         out_dir=CONFIG["out_dir"],
         sample_fraction=CONFIG["sample_fraction"],
         grayscale=CONFIG["grayscale"],
         initial_params=CONFIG["initial_guess"],
-        n_trials=1  # kept for interface compatibility (not used by halving)
+        scale_factor=CONFIG.get("scale_factor", 2) # Pass the new variable here
     )
