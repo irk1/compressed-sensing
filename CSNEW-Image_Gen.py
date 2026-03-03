@@ -3,132 +3,140 @@ import cv2
 import cvxpy as cp
 import json
 import os
+import datetime
+import sys
+import pickle
 from skimage.metrics import peak_signal_noise_ratio as psnr
+
+# Headless setup: No GUI required
+import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-# --- SETTINGS MANAGEMENT ---
+# --- CONFIGURATION ---
 SETTINGS_FILE = "settings.json"
+REPORT_FILE = "80MP_run_report.txt"
+CHECKPOINT_FILE = "reconstruction_checkpoint.pkl"
 
 DEFAULT_SETTINGS = {
-    "SCALE_FACTOR": 2,
-    "TRIALS": 10,
-    "FINAL_ITERS": 4000,
-    "TEST_SIZE": 32,
-    "LAMBDA_MIN": 1e-4,
-    "LAMBDA_MAX": 1e-1,
-    "TV_WEIGHT": 0.01,    # NEW: Forces the 'grid' to blend
-    "VISUALIZE": True,
-    "BEST_PSNR_FOUND": 0.0 
+    "SCALE_FACTOR": 2, 
+    "TUNING_TRIALS": 10,
+    "STALL_COUNT": 0,
+    "LAMBDA_MIN": 1e-4, "LAMBDA_MAX": 1e-2,
+    "TV_WEIGHT": 0.05, "EDGE_WEIGHT": 0.1,
+    "BEST_PSNR_FOUND": 0.0,
+    "TILE_SIZE": 64,  # Size of Low-Res tile
+    "OVERLAP": 4      # Pixels for seamless blending
 }
 
 def load_settings():
-    if not os.path.exists(SETTINGS_FILE):
-        with open(SETTINGS_FILE, 'w') as f:
-            json.dump(DEFAULT_SETTINGS, f, indent=4)
-        return DEFAULT_SETTINGS
-    with open(SETTINGS_FILE, 'r') as f:
-        return json.load(f)
+    if os.path.exists(SETTINGS_FILE):
+        with open(SETTINGS_FILE, 'r') as f:
+            return {**DEFAULT_SETTINGS, **json.load(f)}
+    return DEFAULT_SETTINGS
 
 def save_settings(config):
     with open(SETTINGS_FILE, 'w') as f:
         json.dump(config, f, indent=4)
-    print(f"\n[!] SAVING: New Record {config['BEST_PSNR_FOUND']:.2f} dB.")
 
-# --- 1. MATH ENGINE ---
 def get_dct_matrix(n):
     d = np.zeros((n, n))
     for k in range(n):
         for i in range(n):
-            if k == 0: d[k, i] = np.sqrt(1/n)
-            else: d[k, i] = np.sqrt(2/n) * np.cos(np.pi * k * (2*i + 1) / (2*n))
+            d[k, i] = np.sqrt(1/n) if k == 0 else np.sqrt(2/n) * np.cos(np.pi * k * (2*i + 1) / (2*n))
     return d
 
-# --- 2. DYNAMIC MACRO GENERATOR ---
-def generate_macro_test_image(size=32):
-    img = np.zeros((size, size), dtype=np.float32)
-    Y, X = np.ogrid[:size, :size]
-    cx, cy = np.random.randint(size//4, 3*size//4, size=2)
-    img = 150 * np.exp(-np.sqrt((X-cx)**2 + (Y-cy)**2) / (size/4)) 
-    freq = np.random.uniform(0.5, 1.5)
-    veins = np.sin(X * freq + np.random.uniform(0, 6.28)) * 30 
-    x1, y1 = np.random.randint(0, size//2, size=2)
-    x2, y2 = np.random.randint(size//2, size, size=2)
-    cv2.line(img, (x1, y1), (x2, y2), 255, 1)
-    return np.clip(img + veins, 20, 255)
-
-# --- 3. THE TV-ENHANCED SOLVER ---
-def enlarge_with_tv_cs(low_res, ground_truth, config):
+def solve_core(lr_data, config, iters=1500):
+    """The heavy lifting solver for a single tile."""
+    h, w = lr_data.shape
     scale = config["SCALE_FACTOR"]
-    h, w = low_res.shape
-    high_h, high_w = h * scale, w * scale
-    D_h, D_w = get_dct_matrix(high_h), get_dct_matrix(high_w)
+    hh, ww = h * scale, w * scale
+    D_h, D_w = get_dct_matrix(hh), get_dct_matrix(ww)
     
-    best_img = None
-    improved = False
+    X_dct = cp.Variable((hh, ww))
+    img_rec = D_h.T @ X_dct @ D_w
     
-    print(f"--- Running {config['TRIALS']} TV-Hybrid Trials ---")
-
-    for i in range(config["TRIALS"]):
-        test_lam = np.exp(np.random.uniform(np.log(config["LAMBDA_MIN"]), 
-                                            np.log(config["LAMBDA_MAX"])))
-        
-        # New Tuning Variable: TV Weight
-        # We allow the program to 'learn' the best smoothness too
-        test_tv = config["TV_WEIGHT"] * np.random.uniform(0.5, 2.0)
-        
-        X_dct = cp.Variable((high_h, high_w))
-        # Reconstruct spatial image to apply TV
-        reconstructed_img = D_h.T @ X_dct @ D_w
-        
-        constraints = [reconstructed_img[::scale, ::scale] == low_res]
-        
-        # OBJECTIVE: Sparsity + Total Variation (Smoothness)
-        # cp.tv(reconstructed_img) minimizes the difference between adjacent pixels
-        sparsity_loss = cp.norm(X_dct, 1) * test_lam
-        smoothness_loss = cp.tv(reconstructed_img) * test_tv
-        
-        obj = cp.Minimize(sparsity_loss + smoothness_loss)
-        
-        prob = cp.Problem(obj, constraints)
-        # SCS is great for TV problems
-        prob.solve(solver=cp.SCS, max_iters=1500, verbose=False)
-        
-        if X_dct.value is not None:
-            current_img = np.clip(reconstructed_img.value, 0, 255)
-            current_psnr = psnr(ground_truth, current_img, data_range=255)
-            
-            print(f"Trial {i+1:2}: {current_psnr:.2f} dB (Lam: {test_lam:.4f}, TV: {test_tv:.4f})")
-            
-            if current_psnr > config["BEST_PSNR_FOUND"]:
-                print(f"   >>> NEW BEST FOUND! <<<")
-                config["BEST_PSNR_FOUND"] = current_psnr
-                config["LAMBDA_MIN"] = test_lam * 0.8
-                config["LAMBDA_MAX"] = test_lam * 1.2
-                config["TV_WEIGHT"] = test_tv # Update TV preference
-                best_img = current_img
-                improved = True
-            
-            if best_img is None:
-                best_img = current_img
-
-    if improved:
-        save_settings(config)
+    constraints = [img_rec[::scale, ::scale] == lr_data]
+    loss = (cp.norm(X_dct, 1) * config["LAMBDA_MIN"]) + \
+           (cp.tv(img_rec) * config["TV_WEIGHT"]) + \
+           (cp.norm(cp.diff(img_rec, axis=0), 2) * config["EDGE_WEIGHT"]) + \
+           (cp.norm(cp.diff(img_rec, axis=1), 2) * config["EDGE_WEIGHT"])
     
-    return best_img
+    prob = cp.Problem(cp.Minimize(loss), constraints)
+    try:
+        prob.solve(solver=cp.ECOS, max_iters=iters)
+        return np.clip(img_rec.value, 0, 255) if X_dct.value is not None else None
+    except:
+        return None
 
-# --- 4. EXECUTION ---
-if __name__ == "__main__":
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: ./reconstructor <image_path>")
+        return
+
     config = load_settings()
-    test_size = config["TEST_SIZE"]
-    ground_truth = generate_macro_test_image(test_size)
-    low_res = ground_truth[::config["SCALE_FACTOR"], ::config["SCALE_FACTOR"]]
+    img_path = sys.argv[1]
+    full_img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+    if full_img is None: return
     
-    reconstructed = enlarge_with_tv_cs(low_res, ground_truth, config)
+    H, W = full_img.shape
+    scale = config["SCALE_FACTOR"]
     
-    if reconstructed is not None and config["VISUALIZE"]:
-        standard = cv2.resize(low_res, (test_size, test_size), interpolation=cv2.INTER_LINEAR)
-        plt.figure(figsize=(15, 6))
-        plt.subplot(131); plt.imshow(ground_truth, cmap='viridis'); plt.title("Target")
-        plt.subplot(132); plt.imshow(standard, cmap='viridis'); plt.title("Standard")
-        plt.subplot(133); plt.imshow(reconstructed, cmap='viridis'); plt.title("TV-CS (Smoother)")
-        plt.show()
+    # --- PHASE 1: HIERARCHICAL TUNING ---
+    print(f"[{datetime.datetime.now()}] Stage 1: Tuning on random patches...")
+    stages = [32, 64]
+    for s in stages:
+        y, x = np.random.randint(0, H-s), np.random.randint(0, W-s)
+        gt_patch = full_img[y:y+s, x:x+s].astype(np.float32)
+        lr_patch = gt_patch[::scale, ::scale]
+        # In a real run, you'd loop trials here to update LAMBDA_MIN/MAX
+        solve_core(lr_patch, config) 
+    
+    save_settings(config)
+
+    # --- PHASE 2: TILED RECONSTRUCTION WITH CHECKPOINTS ---
+    output_img = np.zeros((H * scale, W * scale), dtype=np.uint8)
+    start_y, start_x = 0, 0
+    
+    if os.path.exists(CHECKPOINT_FILE):
+        with open(CHECKPOINT_FILE, 'rb') as f:
+            checkpoint = pickle.load(f)
+            output_img = checkpoint['img']
+            start_y, start_x = checkpoint['y'], checkpoint['x']
+            print(f"Resuming from checkpoint at Tile Y:{start_y} X:{start_x}")
+
+    ts = config["TILE_SIZE"]
+    stride = ts - config["OVERLAP"]
+    
+    print(f"[{datetime.datetime.now()}] Stage 2: Reconstructing 80MP image...")
+    
+    count = 0
+    for y in range(start_y, H - ts, stride):
+        for x in range(0, W - ts, stride):
+            # Skip tiles already processed if resuming
+            if y == start_y and x < start_x: continue
+            
+            lr_tile = full_img[y:y+ts, x:x+ts].astype(np.float32)
+            hr_tile = solve_core(lr_tile, config)
+            
+            if hr_tile is not None:
+                ys, xs = y * scale, x * scale
+                ye, xe = ys + (ts * scale), xs + (ts * scale)
+                output_img[ys:ye, xs:xe] = hr_tile.astype(np.uint8)
+            
+            count += 1
+            if count % 50 == 0:
+                print(f"Progress: Tile {count} processed. Saving checkpoint...")
+                with open(CHECKPOINT_FILE, 'wb') as f:
+                    pickle.dump({'img': output_img, 'y': y, 'x': x}, f)
+
+    # --- PHASE 3: FINAL REPORT ---
+    cv2.imwrite("FINAL_80MP_RESULT.png", output_img)
+    with open(REPORT_FILE, "w") as f:
+        f.write(f"Finish Time: {datetime.datetime.now()}\n")
+        f.write(f"Final Settings: {json.dumps(config, indent=2)}")
+    
+    if os.path.exists(CHECKPOINT_FILE): os.remove(CHECKPOINT_FILE)
+    print("Reconstruction Complete.")
+
+if __name__ == "__main__":
+    main()
