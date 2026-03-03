@@ -1,2 +1,4 @@
 OLD/dataset/original.npy
 OLD/dataset/sampled.npy
+build/CSNEW-Image_Gen/CSNEW-Image_Gen.pkg
+dist/CSNEW-Image_Gen
