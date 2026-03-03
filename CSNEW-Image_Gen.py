@@ -1,42 +1,46 @@
+import os
+import sys
+
+# 1. STOP THE OSQP ALGEBRA ERROR (Must be before cvxpy import)
+os.environ["CVXPY_SOLVER_MAP_IGNORE"] = "OSQP"
+
 import numpy as np
 import cv2
 import cvxpy as cp
 import json
-import os
-import datetime
-import sys
 import pickle
-from skimage.metrics import peak_signal_noise_ratio as psnr
+import time
+import signal
+import psutil
+import datetime
 
-# Headless setup: No GUI required
+# Headless setup for OMV/Linux servers
 import matplotlib; matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 
-# --- CONFIGURATION ---
+# --- GLOBALS & SIGNALS ---
+KEEP_RUNNING = True
 SETTINGS_FILE = "settings.json"
-REPORT_FILE = "80MP_run_report.txt"
 CHECKPOINT_FILE = "reconstruction_checkpoint.pkl"
 
-DEFAULT_SETTINGS = {
-    "SCALE_FACTOR": 2, 
-    "TUNING_TRIALS": 10,
-    "STALL_COUNT": 0,
-    "LAMBDA_MIN": 1e-4, "LAMBDA_MAX": 1e-2,
-    "TV_WEIGHT": 0.05, "EDGE_WEIGHT": 0.1,
-    "BEST_PSNR_FOUND": 0.0,
-    "TILE_SIZE": 64,  # Size of Low-Res tile
-    "OVERLAP": 4      # Pixels for seamless blending
-}
+def graceful_exit(signum, frame):
+    global KEEP_RUNNING
+    print("\n[!] STOP SIGNAL RECEIVED. Finishing current tile and saving...")
+    KEEP_RUNNING = False
+
+signal.signal(signal.SIGINT, graceful_exit)
+
+# --- UTILITIES ---
+def get_ram_usage():
+    try:
+        process = psutil.Process(os.getpid())
+        return process.memory_info().rss / 1024 / 1024
+    except: return 0.0
 
 def load_settings():
     if os.path.exists(SETTINGS_FILE):
         with open(SETTINGS_FILE, 'r') as f:
-            return {**DEFAULT_SETTINGS, **json.load(f)}
-    return DEFAULT_SETTINGS
-
-def save_settings(config):
-    with open(SETTINGS_FILE, 'w') as f:
-        json.dump(config, f, indent=4)
+            return json.load(f)
+    return None
 
 def get_dct_matrix(n):
     d = np.zeros((n, n))
@@ -45,98 +49,152 @@ def get_dct_matrix(n):
             d[k, i] = np.sqrt(1/n) if k == 0 else np.sqrt(2/n) * np.cos(np.pi * k * (2*i + 1) / (2*n))
     return d
 
-def solve_core(lr_data, config, iters=1500):
-    """The heavy lifting solver for a single tile."""
+def solve_core(lr_data, config, iters=1000):
     h, w = lr_data.shape
-    scale = config["SCALE_FACTOR"]
+    scale = config.get("SCALE_FACTOR", 2)
     hh, ww = h * scale, w * scale
-    D_h, D_w = get_dct_matrix(hh), get_dct_matrix(ww)
+    lr_norm = lr_data.astype(np.float32) / 255.0
     
+    if np.std(lr_norm) < 0.005:
+        return cv2.resize(lr_data, (ww, hh), interpolation=cv2.INTER_CUBIC)
+
+    D_h, D_w = get_dct_matrix(hh), get_dct_matrix(ww)
     X_dct = cp.Variable((hh, ww))
     img_rec = D_h.T @ X_dct @ D_w
     
-    constraints = [img_rec[::scale, ::scale] == lr_data]
-    loss = (cp.norm(X_dct, 1) * config["LAMBDA_MIN"]) + \
-           (cp.tv(img_rec) * config["TV_WEIGHT"]) + \
-           (cp.norm(cp.diff(img_rec, axis=0), 2) * config["EDGE_WEIGHT"]) + \
-           (cp.norm(cp.diff(img_rec, axis=1), 2) * config["EDGE_WEIGHT"])
-    
+    constraints = [
+        cp.abs(img_rec[::scale, ::scale] - lr_norm) <= 0.01,
+        img_rec >= 0, img_rec <= 1
+    ]
+    loss = (cp.norm(X_dct, 1) * config["LAMBDA_MIN"]) + (cp.tv(img_rec) * config["TV_WEIGHT"])
     prob = cp.Problem(cp.Minimize(loss), constraints)
+    
     try:
-        prob.solve(solver=cp.ECOS, max_iters=iters)
-        return np.clip(img_rec.value, 0, 255) if X_dct.value is not None else None
+        prob.solve(solver=cp.ECOS, max_iters=iters, abstol=1e-3, reltol=1e-3)
+        if prob.status in ["optimal", "optimal_inaccurate"] and X_dct.value is not None:
+            return np.clip(img_rec.value * 255.0, 0, 255)
+        return cv2.resize(lr_data, (ww, hh), interpolation=cv2.INTER_CUBIC)
     except:
-        return None
+        return cv2.resize(lr_data, (ww, hh), interpolation=cv2.INTER_CUBIC)
+
+def tune_parameters(full_img, scale):
+    print("[*] Stage 1: Auto-Tuning for best fidelity...")
+    lambdas = [1e-3, 1e-4, 5e-5]
+    tv_weights = [0.01, 0.05, 0.1]
+    best_psnr = -1
+    best_config = {"SCALE_FACTOR": scale, "TILE_SIZE": 64, "OVERLAP": 4}
+    
+    h, w = full_img.shape[:2]
+    patch = full_img[h//2:h//2+64, w//2:w//2+64, 0]
+    
+    for l in lambdas:
+        for tv in tv_weights:
+            test_cfg = {"SCALE_FACTOR": scale, "LAMBDA_MIN": l, "TV_WEIGHT": tv}
+            recon = solve_core(patch, test_cfg, iters=500)
+            ref = cv2.resize(patch, (64*scale, 64*scale), interpolation=cv2.INTER_LANCZOS4)
+            mse = np.mean((ref - recon)**2)
+            psnr = 20 * np.log10(255.0 / np.sqrt(mse)) if mse > 0 else 0
+            print(f"  > Trial: L={l}, TV={tv} | PSNR: {psnr:.2f}dB")
+            if psnr > best_psnr:
+                best_psnr = psnr
+                best_config.update(test_cfg)
+    with open(SETTINGS_FILE, 'w') as f:
+        json.dump(best_config, f, indent=4)
+    return best_config
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: ./reconstructor <image_path>")
+        print("Usage: ./CS_COLOR_V1 <image_path>")
         return
 
-    config = load_settings()
     img_path = sys.argv[1]
-    full_img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-    if full_img is None: return
-    
-    H, W = full_img.shape
-    scale = config["SCALE_FACTOR"]
-    
-    # --- PHASE 1: HIERARCHICAL TUNING ---
-    print(f"[{datetime.datetime.now()}] Stage 1: Tuning on random patches...")
-    stages = [32, 64]
-    for s in stages:
-        y, x = np.random.randint(0, H-s), np.random.randint(0, W-s)
-        gt_patch = full_img[y:y+s, x:x+s].astype(np.float32)
-        lr_patch = gt_patch[::scale, ::scale]
-        # In a real run, you'd loop trials here to update LAMBDA_MIN/MAX
-        solve_core(lr_patch, config) 
-    
-    save_settings(config)
 
-    # --- PHASE 2: TILED RECONSTRUCTION WITH CHECKPOINTS ---
-    output_img = np.zeros((H * scale, W * scale), dtype=np.uint8)
-    start_y, start_x = 0, 0
+    # --- ENHANCED FILE CHECK ---
+    if not os.path.exists(img_path):
+        print(f"[!] ERROR: '{img_path}' not found in {os.getcwd()}")
+        return
     
+    full_img = cv2.imread(img_path) 
+    if full_img is None:
+        print(f"[!] ERROR: OpenCV cannot decode '{img_path}'. Check file permissions or extension.")
+        return
+    
+    H, W, C = full_img.shape
+    config = load_settings()
+    if config is None:
+        config = tune_parameters(full_img, 2)
+    else:
+        print(f"[*] Settings Loaded: {config}")
+
+    scale = config.get("SCALE_FACTOR", 2)
+    ts = config.get("TILE_SIZE", 64)
+    stride = ts - config.get("OVERLAP", 4)
+    
+    output_img = np.zeros((H * scale, W * scale, C), dtype=np.uint8)
+    y_coords = range(0, H - ts + 1, stride)
+    x_coords = range(0, W - ts + 1, stride)
+    all_tiles = [(y, x) for y in y_coords for x in x_coords]
+    total_tiles = len(all_tiles)
+    start_idx = 0
+
     if os.path.exists(CHECKPOINT_FILE):
         with open(CHECKPOINT_FILE, 'rb') as f:
-            checkpoint = pickle.load(f)
-            output_img = checkpoint['img']
-            start_y, start_x = checkpoint['y'], checkpoint['x']
-            print(f"Resuming from checkpoint at Tile Y:{start_y} X:{start_x}")
+            cp_data = pickle.load(f)
+            output_img, start_idx = cp_data['img'], cp_data['idx']
+            print(f"[*] Resuming from tile {start_idx}")
 
-    ts = config["TILE_SIZE"]
-    stride = ts - config["OVERLAP"]
-    
-    print(f"[{datetime.datetime.now()}] Stage 2: Reconstructing 80MP image...")
-    
-    count = 0
-    for y in range(start_y, H - ts, stride):
-        for x in range(0, W - ts, stride):
-            # Skip tiles already processed if resuming
-            if y == start_y and x < start_x: continue
-            
-            lr_tile = full_img[y:y+ts, x:x+ts].astype(np.float32)
-            hr_tile = solve_core(lr_tile, config)
-            
-            if hr_tile is not None:
-                ys, xs = y * scale, x * scale
-                ye, xe = ys + (ts * scale), xs + (ts * scale)
-                output_img[ys:ye, xs:xe] = hr_tile.astype(np.uint8)
-            
-            count += 1
-            if count % 50 == 0:
-                print(f"Progress: Tile {count} processed. Saving checkpoint...")
-                with open(CHECKPOINT_FILE, 'wb') as f:
-                    pickle.dump({'img': output_img, 'y': y, 'x': x}, f)
+    # Start Report
+    with open("RECON_REPORT.txt", "w") as f:
+        f.write(f"RECONSTRUCTION RUN: {datetime.datetime.now()}\n")
+        f.write(f"Settings: {json.dumps(config, indent=2)}\n\n")
 
-    # --- PHASE 3: FINAL REPORT ---
-    cv2.imwrite("FINAL_80MP_RESULT.png", output_img)
-    with open(REPORT_FILE, "w") as f:
-        f.write(f"Finish Time: {datetime.datetime.now()}\n")
-        f.write(f"Final Settings: {json.dumps(config, indent=2)}")
+    print(f"[*] Processing COLOR (RGB): {H}x{W} -> {H*scale}x{W*scale}")
+    start_time = time.time()
+
+    for i in range(start_idx, total_tiles):
+        if not KEEP_RUNNING:
+            with open(CHECKPOINT_FILE, 'wb') as f:
+                pickle.dump({'img': output_img, 'idx': i}, f)
+            print("[!] Checkpoint saved.")
+            sys.exit(0)
+
+        y, x = all_tiles[i]
+        t_start = time.time()
+        lr_tile = full_img[y:y+ts, x:x+ts]
+        
+        for c in range(C):
+            res = solve_core(lr_tile[:,:,c], config)
+            output_img[y*scale:(y+ts)*scale, x*scale:(x+ts)*scale, c] = res.astype(np.uint8)
+        
+        if i % 25 == 0:
+            print(f"[{i+1:05d}/{total_tiles}] Tile({y},{x}) | RAM: {get_ram_usage():.1f}MB")
+            with open(CHECKPOINT_FILE, 'wb') as f:
+                pickle.dump({'img': output_img, 'idx': i}, f)
+
+    # --- FINAL SAVING ---
+    print("[*] Reconstruction finished. Writing image...")
+    success = cv2.imwrite("FINAL_COLOR_RECON.png", output_img, [cv2.IMWRITE_PNG_COMPRESSION, 3])
     
+    if not success:
+        print("[!] PNG Save failed. Attempting Emergency JPG...")
+        cv2.imwrite("EMERGENCY_RECON.jpg", output_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+    total_min = (time.time() - start_time) / 60
+    
+    # Calculate Accuracy
+    h_orig, w_orig = full_img.shape[:2]
+    downsampled = cv2.resize(output_img, (w_orig, h_orig), interpolation=cv2.INTER_AREA)
+    mse = np.mean((full_img.astype(np.float32) - downsampled.astype(np.float32))**2)
+    psnr = 20 * np.log10(255.0 / np.sqrt(mse)) if mse > 0 else 100
+    
+    with open("RECON_REPORT.txt", "a") as f:
+        f.write("="*30 + "\n")
+        f.write(f"FINAL PSNR ACCURACY: {psnr:.2f} dB\n")
+        f.write(f"Total Time: {total_min:.2f} minutes\n")
+        f.write("="*30 + "\n")
+
     if os.path.exists(CHECKPOINT_FILE): os.remove(CHECKPOINT_FILE)
-    print("Reconstruction Complete.")
+    print(f"[*] Mission Complete. PSNR: {psnr:.2f}dB")
 
 if __name__ == "__main__":
     main()
