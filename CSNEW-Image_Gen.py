@@ -15,7 +15,7 @@ import psutil
 import datetime
 
 # Headless setup for OMV/Linux servers
-import matplotlib; matplotlib.use('Agg')
+import matplotlib#; matplotlib.use('Agg')
 
 # --- GLOBALS & SIGNALS ---
 KEEP_RUNNING = True
@@ -77,54 +77,65 @@ def solve_core(lr_data, config, iters=1000):
     except:
         return cv2.resize(lr_data, (ww, hh), interpolation=cv2.INTER_CUBIC)
 
-def tune_parameters(full_img, scale):
-    print("[*] Stage 1: Auto-Tuning for best fidelity...")
-    lambdas = [1e-3, 1e-4, 5e-5]
-    tv_weights = [0.01, 0.05, 0.1]
+def tune_parameters(full_img, scale, base_config=None):
+    if base_config:
+        print(f"[*] REFINE MODE: Tuning around existing settings: L={base_config['LAMBDA_MIN']:.2e}")
+        # Narrow search: 0.5x, 1x, and 2x current values
+        lambdas = [base_config["LAMBDA_MIN"] * 0.5, base_config["LAMBDA_MIN"], base_config["LAMBDA_MIN"] * 2.0]
+        tv_weights = [base_config["TV_WEIGHT"] * 0.5, base_config["TV_WEIGHT"], base_config["TV_WEIGHT"] * 2.0]
+    else:
+        print("[*] FRESH TUNE: Searching broad parameter space...")
+        lambdas = [1e-3, 1e-4, 1e-5]
+        tv_weights = [0.01, 0.05, 0.1]
+    
     best_psnr = -1
-    best_config = {"SCALE_FACTOR": scale, "TILE_SIZE": 64, "OVERLAP": 4}
+    final_config = {"SCALE_FACTOR": scale, "TILE_SIZE": 64, "OVERLAP": 4}
     
     h, w = full_img.shape[:2]
-    patch = full_img[h//2:h//2+64, w//2:w//2+64, 0]
+    # Use a 128px patch for tuning accuracy
+    patch = full_img[h//2:h//2+128, w//2:w//2+128, 0] 
     
     for l in lambdas:
         for tv in tv_weights:
             test_cfg = {"SCALE_FACTOR": scale, "LAMBDA_MIN": l, "TV_WEIGHT": tv}
-            recon = solve_core(patch, test_cfg, iters=500)
-            ref = cv2.resize(patch, (64*scale, 64*scale), interpolation=cv2.INTER_LANCZOS4)
+            recon = solve_core(patch, test_cfg, iters=600)
+            ref = cv2.resize(patch, (128*scale, 128*scale), interpolation=cv2.INTER_LANCZOS4)
             mse = np.mean((ref - recon)**2)
             psnr = 20 * np.log10(255.0 / np.sqrt(mse)) if mse > 0 else 0
-            print(f"  > Trial: L={l}, TV={tv} | PSNR: {psnr:.2f}dB")
+            print(f"  > Trial: L={l:.2e}, TV={tv:.2e} | PSNR: {psnr:.2f}dB")
             if psnr > best_psnr:
                 best_psnr = psnr
-                best_config.update(test_cfg)
+                final_config.update(test_cfg)
+
     with open(SETTINGS_FILE, 'w') as f:
-        json.dump(best_config, f, indent=4)
-    return best_config
+        json.dump(final_config, f, indent=4)
+    return final_config
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: ./CS_COLOR_V1 <image_path>")
-        return
+    args = sys.argv[1:]
+    if not args:
+        print("Usage: ./CS_COLOR_V1 <image_path> [--refine]"); return
 
-    img_path = sys.argv[1]
+    img_path = args[0]
+    refine_mode = "--refine" in args
 
-    # --- ENHANCED FILE CHECK ---
     if not os.path.exists(img_path):
-        print(f"[!] ERROR: '{img_path}' not found in {os.getcwd()}")
-        return
+        print(f"[!] ERROR: '{img_path}' not found."); return
     
     full_img = cv2.imread(img_path) 
     if full_img is None:
-        print(f"[!] ERROR: OpenCV cannot decode '{img_path}'. Check file permissions or extension.")
-        return
+        print(f"[!] ERROR: Cannot decode '{img_path}'."); return
     
     H, W, C = full_img.shape
-    config = load_settings()
-    if config is None:
+    existing_config = load_settings()
+
+    if refine_mode:
+        config = tune_parameters(full_img, 2, base_config=existing_config)
+    elif existing_config is None:
         config = tune_parameters(full_img, 2)
     else:
-        print(f"[*] Settings Loaded: {config}")
+        config = existing_config
+        print(f"[*] Using existing settings: {config}")
 
     scale = config.get("SCALE_FACTOR", 2)
     ts = config.get("TILE_SIZE", 64)
@@ -143,9 +154,10 @@ def main():
             output_img, start_idx = cp_data['img'], cp_data['idx']
             print(f"[*] Resuming from tile {start_idx}")
 
-    # Start Report
+    # Initial Report
     with open("RECON_REPORT.txt", "w") as f:
         f.write(f"RECONSTRUCTION RUN: {datetime.datetime.now()}\n")
+        f.write(f"Refine Mode: {refine_mode}\n")
         f.write(f"Settings: {json.dumps(config, indent=2)}\n\n")
 
     print(f"[*] Processing COLOR (RGB): {H}x{W} -> {H*scale}x{W*scale}")
@@ -155,7 +167,7 @@ def main():
         if not KEEP_RUNNING:
             with open(CHECKPOINT_FILE, 'wb') as f:
                 pickle.dump({'img': output_img, 'idx': i}, f)
-            print("[!] Checkpoint saved.")
+            print("[!] Checkpoint saved. Safe to exit.")
             sys.exit(0)
 
         y, x = all_tiles[i]
@@ -166,22 +178,21 @@ def main():
             res = solve_core(lr_tile[:,:,c], config)
             output_img[y*scale:(y+ts)*scale, x*scale:(x+ts)*scale, c] = res.astype(np.uint8)
         
-        if i % 25 == 0:
+        if i % 25 == 0 or i == total_tiles - 1:
             print(f"[{i+1:05d}/{total_tiles}] Tile({y},{x}) | RAM: {get_ram_usage():.1f}MB")
             with open(CHECKPOINT_FILE, 'wb') as f:
                 pickle.dump({'img': output_img, 'idx': i}, f)
 
     # --- FINAL SAVING ---
-    print("[*] Reconstruction finished. Writing image...")
+    print("[*] Saving FINAL_COLOR_RECON.png...")
     success = cv2.imwrite("FINAL_COLOR_RECON.png", output_img, [cv2.IMWRITE_PNG_COMPRESSION, 3])
     
     if not success:
-        print("[!] PNG Save failed. Attempting Emergency JPG...")
         cv2.imwrite("EMERGENCY_RECON.jpg", output_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
 
     total_min = (time.time() - start_time) / 60
     
-    # Calculate Accuracy
+    # Calculate Final Accuracy
     h_orig, w_orig = full_img.shape[:2]
     downsampled = cv2.resize(output_img, (w_orig, h_orig), interpolation=cv2.INTER_AREA)
     mse = np.mean((full_img.astype(np.float32) - downsampled.astype(np.float32))**2)
