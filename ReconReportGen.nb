@@ -10,10 +10,10 @@
 NotebookFileLineBreakTest
 NotebookFileLineBreakTest
 NotebookDataPosition[       158,          7]
-NotebookDataLength[     11133,        299]
-NotebookOptionsPosition[     10646,        282]
-NotebookOutlinePosition[     11052,        298]
-CellTagsIndexPosition[     11009,        295]
+NotebookDataLength[     13596,        367]
+NotebookOptionsPosition[     13107,        350]
+NotebookOutlinePosition[     13513,        366]
+CellTagsIndexPosition[     13470,        363]
 WindowFrame->Normal*)
 
 (* Beginning of Notebook Content *)
@@ -37,10 +37,13 @@ Cell[BoxData[
     RowBox[{"img2", "=", 
      RowBox[{"Import", "[", 
       RowBox[{"SystemDialogInput", "[", "\"\<FileOpen\>\"", "]"}], "]"}]}], 
-    ";"}], "\[IndentingNewLine]", "\n", 
+    ";"}], "\[IndentingNewLine]", "\[IndentingNewLine]", 
    RowBox[{"(*", 
     RowBox[{
-     RowBox[{"2.", " ", "PRE"}], "-", "PROCESSING"}], "*)"}], 
+     RowBox[{"2.", " ", "PRE"}], "-", "PROCESSING", "-", 
+     RowBox[{"Brute", " ", "Force", " ", "Standardization"}]}], "*)"}], "\n", 
+   RowBox[{"(*", 
+    RowBox[{"Force", " ", "Resize", " ", "first"}], "*)"}], 
    "\[IndentingNewLine]", 
    RowBox[{
     RowBox[{"img2Resized", "=", 
@@ -50,6 +53,28 @@ Cell[BoxData[
    "\[IndentingNewLine]", "\n", 
    RowBox[{"(*", 
     RowBox[{
+     RowBox[{"Force", " ", "both", " ", "to", " ", "3"}], "-", 
+     RowBox[{"channel", " ", "RGB", " ", 
+      RowBox[{"and", "'"}], 
+      RowBox[{"Real", "'"}], " ", "bit", " ", "depth", " ", "to", " ", 
+      "prevent", " ", "symbolic", " ", "mismatch"}]}], "*)"}], 
+   "\[IndentingNewLine]", 
+   RowBox[{
+    RowBox[{"ref", "=", 
+     RowBox[{"Image", "[", 
+      RowBox[{
+       RowBox[{"ColorConvert", "[", 
+        RowBox[{"img1", ",", "\"\<RGB\>\""}], "]"}], ",", "\"\<Real\>\""}], 
+      "]"}]}], ";"}], "\n", 
+   RowBox[{
+    RowBox[{"recon", "=", 
+     RowBox[{"Image", "[", 
+      RowBox[{
+       RowBox[{"ColorConvert", "[", 
+        RowBox[{"img2Resized", ",", "\"\<RGB\>\""}], "]"}], ",", 
+       "\"\<Real\>\""}], "]"}]}], ";"}], "\[IndentingNewLine]", "\n", 
+   RowBox[{"(*", 
+    RowBox[{
     "3.", " ", "GENERATE", " ", "COLORFUL", " ", "HEATMAP", " ", "WITH", " ", 
      "SOLID", " ", "BORDER"}], "*)"}], "\[IndentingNewLine]", 
    RowBox[{
@@ -57,8 +82,8 @@ Cell[BoxData[
      RowBox[{"ColorConvert", "[", 
       RowBox[{
        RowBox[{"ImageDifference", "[", 
-        RowBox[{"img1", ",", "img2Resized"}], "]"}], ",", 
-       "\"\<GrayScale\>\""}], "]"}]}], ";"}], "\n", 
+        RowBox[{"ref", ",", "recon"}], "]"}], ",", "\"\<GrayScale\>\""}], 
+      "]"}]}], ";"}], "\n", 
    RowBox[{
     RowBox[{"rawHeatMap", "=", 
      RowBox[{"Colorize", "[", 
@@ -71,46 +96,102 @@ Cell[BoxData[
    RowBox[{
     RowBox[{"heatMap", "=", 
      RowBox[{"ImagePad", "[", 
-      RowBox[{"rawHeatMap", ",", "2", ",", "Black"}], "]"}]}], ";"}], "\n", 
-   "\[IndentingNewLine]", 
+      RowBox[{"rawHeatMap", ",", "2", ",", "Black"}], "]"}]}], ";"}], 
+   "\[IndentingNewLine]", "\[IndentingNewLine]", 
    RowBox[{"(*", 
-    RowBox[{"4.", " ", "STATISTICAL", " ", "ANALYSIS"}], "*)"}], 
+    RowBox[{
+     RowBox[{"4.", " ", "STATISTICAL", " ", "ANALYSIS"}], "-", "Multi", "-", 
+     RowBox[{"Layered", " ", "Force", " ", "Evaluation"}]}], "*)"}], "\n", 
+   RowBox[{"(*", "MSE", "*)"}], "\[IndentingNewLine]", 
    RowBox[{
-    RowBox[{"mse", "=", 
-     RowBox[{"ImageDistance", "[", 
-      RowBox[{"img1", ",", "img2Resized", ",", 
-       RowBox[{
-       "DistanceFunction", "->", "\"\<MeanSquaredEuclideanDistance\>\""}]}], 
-      "]"}]}], ";"}], "\n", 
-   RowBox[{
-    RowBox[{"psnr", "=", 
-     RowBox[{"10", "*", 
-      RowBox[{"Log10", "[", 
-       RowBox[{"1", "/", "mse"}], "]"}]}]}], ";"}], "\n", 
-   RowBox[{
-    RowBox[{"corr", "=", 
-     RowBox[{"ImageDistance", "[", 
-      RowBox[{"img1", ",", "img2Resized", ",", 
-       RowBox[{"DistanceFunction", "->", "\"\<CorrelationDistance\>\""}]}], 
-      "]"}]}], ";"}], "\[IndentingNewLine]", "\n", 
+    RowBox[{"mseVal", "=", 
+     RowBox[{"N", "[", 
+      RowBox[{"ImageDistance", "[", 
+       RowBox[{"ref", ",", "recon", ",", 
+        RowBox[{
+        "DistanceFunction", "->", "\"\<MeanSquaredEuclideanDistance\>\""}]}], 
+       "]"}], "]"}]}], ";"}], "\[IndentingNewLine]", "\n", 
    RowBox[{"(*", 
-    RowBox[{"CORRECTED", ":", 
-     RowBox[{"Use", " ", "ImageSimilarity", " ", "for", " ", "SSIM"}]}], 
-    "*)"}], "\[IndentingNewLine]", 
+    RowBox[{"PSNR", "-", 
+     RowBox[{
+     "Handle", " ", "potential", " ", "Log", " ", "of", " ", "Zero", " ", 
+      "errors"}]}], "*)"}], "\[IndentingNewLine]", 
+   RowBox[{
+    RowBox[{"psnrVal", "=", 
+     RowBox[{"If", "[", 
+      RowBox[{
+       RowBox[{"mseVal", ">", "0"}], ",", 
+       RowBox[{"10", "*", 
+        RowBox[{"Log10", "[", 
+         RowBox[{"1", "/", "mseVal"}], "]"}]}], ",", "100"}], "]"}]}], ";"}], 
+   "\[IndentingNewLine]", "\n", 
+   RowBox[{"(*", "Correlation", "*)"}], "\[IndentingNewLine]", 
+   RowBox[{
+    RowBox[{"corrVal", "=", 
+     RowBox[{"N", "[", 
+      RowBox[{"ImageDistance", "[", 
+       RowBox[{"ref", ",", "recon", ",", 
+        RowBox[{"DistanceFunction", "->", "\"\<CorrelationDistance\>\""}]}], 
+       "]"}], "]"}]}], ";"}], "\[IndentingNewLine]", "\[IndentingNewLine]", 
+   RowBox[{"(*", 
+    RowBox[{"SSIM", "-", 
+     RowBox[{
+      RowBox[{"The", "'"}], "Brute", " ", 
+      RowBox[{"Force", "'"}], " ", "Similarity", " ", "Calculation"}]}], 
+    "*)"}], "\n", 
    RowBox[{"(*", 
     RowBox[{
      RowBox[{
-     "This", " ", "returns", " ", "a", " ", "value", " ", "between", " ", "0",
-       " ", "and", " ", "1"}], ",", 
-     RowBox[{
-     "where", " ", "1", " ", "is", " ", "a", " ", "perfect", " ", 
-      "structural", " ", "match"}]}], "*)"}], "\[IndentingNewLine]", 
+     "We", " ", "use", " ", "a", " ", "Check", " ", "wrapper", " ", "to", " ",
+       "stop", " ", "it", " ", "from", " ", "outputting", " ", "a", " ", 
+      "code"}], "-", 
+     RowBox[{"box", " ", "if", " ", "it", " ", "fails"}]}], "*)"}], 
+   "\[IndentingNewLine]", 
    RowBox[{
-    RowBox[{"ssim", "=", 
-     RowBox[{"ImageSimilarity", "[", 
-      RowBox[{"img1", ",", "img2Resized", ",", 
-       RowBox[{"Method", "->", "\"\<StructuralSimilarity\>\""}]}], "]"}]}], 
-    ";"}], "\n", "\[IndentingNewLine]", 
+    RowBox[{"ssimVal", "=", 
+     RowBox[{"Check", "[", 
+      RowBox[{
+       RowBox[{"N", "[", 
+        RowBox[{"ImageSimilarity", "[", 
+         RowBox[{"ref", ",", "recon", ",", 
+          RowBox[{"Method", "->", "\"\<StructuralSimilarity\>\""}]}], "]"}], 
+        "]"}], ",", "\"\<Calculation Error\>\""}], "]"}]}], ";"}], 
+   "\[IndentingNewLine]", "\n", 
+   RowBox[{"(*", 
+    RowBox[{"Final", " ", 
+     RowBox[{"Formatting", ":", 
+      RowBox[{"Convert", " ", "everything", " ", "to", " ", "pure", " ", 
+       RowBox[{"strings", "/", "numbers"}], " ", "to", " ", "kill", " ", 
+       "code", " ", "boxes"}]}]}], "*)"}], "\[IndentingNewLine]", 
+   RowBox[{
+    RowBox[{"finalMSE", "=", 
+     RowBox[{"NumberForm", "[", 
+      RowBox[{"mseVal", ",", 
+       RowBox[{"{", 
+        RowBox[{"Infinity", ",", "6"}], "}"}]}], "]"}]}], ";"}], "\n", 
+   RowBox[{
+    RowBox[{"finalPSNR", "=", 
+     RowBox[{
+      RowBox[{"ToString", "[", 
+       RowBox[{"Round", "[", 
+        RowBox[{
+         RowBox[{"N", "[", "psnrVal", "]"}], ",", "0.01"}], "]"}], "]"}], 
+      "<>", "\"\< dB\>\""}]}], ";"}], "\n", 
+   RowBox[{
+    RowBox[{"finalCorr", "=", 
+     RowBox[{"NumberForm", "[", 
+      RowBox[{
+       RowBox[{"N", "[", "corrVal", "]"}], ",", 
+       RowBox[{"{", 
+        RowBox[{"Infinity", ",", "4"}], "}"}]}], "]"}]}], ";"}], "\n", 
+   RowBox[{
+    RowBox[{"finalSSIM", "=", 
+     RowBox[{"If", "[", 
+      RowBox[{
+       RowBox[{"NumberQ", "[", "ssimVal", "]"}], ",", 
+       RowBox[{"Round", "[", 
+        RowBox[{"ssimVal", ",", "0.0001"}], "]"}], ",", 
+       "\"\<Error: Re-run\>\""}], "]"}]}], ";"}], "\[IndentingNewLine]", "\n", 
    RowBox[{"(*", 
     RowBox[{"5.", " ", "GENERATE", " ", "REPORT", " ", "LAYOUT"}], "*)"}], 
    "\[IndentingNewLine]", 
@@ -162,31 +243,19 @@ Cell[BoxData[
              RowBox[{"{", 
               RowBox[{"\"\<Metric\>\"", ",", "\"\<Value\>\""}], "}"}], ",", 
              RowBox[{"{", 
-              RowBox[{"\"\<Mean Squared Error (MSE)\>\"", ",", "mse"}], "}"}],
-              ",", 
+              RowBox[{"\"\<Mean Squared Error (MSE)\>\"", ",", "finalMSE"}], 
+              "}"}], ",", 
              RowBox[{"{", 
-              RowBox[{"\"\<Peak Signal-to-Noise Ratio (PSNR)\>\"", ",", 
-               RowBox[{"Row", "[", 
-                RowBox[{"{", 
-                 RowBox[{
-                  RowBox[{"NumberForm", "[", 
-                   RowBox[{"psnr", ",", 
-                    RowBox[{"{", 
-                    RowBox[{"4", ",", "2"}], "}"}]}], "]"}], ",", 
-                  "\"\< dB\>\""}], "}"}], "]"}]}], "}"}], ",", 
+              RowBox[{
+              "\"\<Peak Signal-to-Noise Ratio (PSNR)\>\"", ",", "finalPSNR"}],
+               "}"}], ",", 
              RowBox[{"{", 
-              RowBox[{"\"\<Correlation Distance\>\"", ",", 
-               RowBox[{"NumberForm", "[", 
-                RowBox[{"corr", ",", 
-                 RowBox[{"{", 
-                  RowBox[{"4", ",", "4"}], "}"}]}], "]"}]}], "}"}], ",", 
+              RowBox[{"\"\<Correlation Distance\>\"", ",", "finalCorr"}], 
+              "}"}], ",", 
              RowBox[{"{", 
-              RowBox[{"\"\<Structural Similarity (SSIM)\>\"", ",", 
-               RowBox[{"NumberForm", "[", 
-                RowBox[{"ssim", ",", 
-                 RowBox[{"{", 
-                  RowBox[{"4", ",", "4"}], "}"}]}], "]"}]}], "}"}]}], "}"}], 
-           ",", 
+              RowBox[{
+              "\"\<Structural Similarity (SSIM)\>\"", ",", "finalSSIM"}], 
+              "}"}]}], "}"}], ",", 
            RowBox[{"Frame", "->", "All"}], ",", 
            RowBox[{"Background", "->", 
             RowBox[{"{", 
@@ -236,15 +305,15 @@ structure. Ideal = 1.0.\>\""}], "}"}]}], "}"}], ",",
               RowBox[{"12", ",", "43"}], "}"}], "}"}]}]}], "]"}]}], "}"}], 
        ",", 
        RowBox[{"Spacings", "->", "2"}]}], "]"}]}], ";"}], 
-   "\[IndentingNewLine]", "\[IndentingNewLine]", 
+   "\[IndentingNewLine]", "\n", 
    RowBox[{"(*", 
     RowBox[{"6.", " ", "EXPORT"}], "*)"}], "\[IndentingNewLine]", 
    RowBox[{
     RowBox[{
     "exportPath", "=", 
      "\"\<C:\\\\Users\\\\izzyk\\\\OneDrive\\\\Documents\\\\GitHub\\\\\
-compressed-sensing\\\\Comparison_Report.pdf\>\""}], ";"}], 
-   "\[IndentingNewLine]", "\n", 
+compressed-sensing\\\\Comparison_Report.pdf\>\""}], ";"}], "\n", 
+   "\[IndentingNewLine]", 
    RowBox[{
     RowBox[{"If", "[", 
      RowBox[{
@@ -257,8 +326,8 @@ compressed-sensing\\\\Comparison_Report.pdf\>\""}], ";"}],
          "Print", "[", 
           "\"\<Error: Please close the PDF file in your viewer before running \
 this script!\>\"", "]"}], ";", "\[IndentingNewLine]", 
-         RowBox[{"Abort", "[", "]"}]}]}], "]"}]}], "]"}], ";"}], 
-   "\[IndentingNewLine]", "\n", 
+         RowBox[{"Abort", "[", "]"}]}]}], "]"}]}], "]"}], ";"}], "\n", 
+   "\[IndentingNewLine]", 
    RowBox[{
     RowBox[{"Export", "[", 
      RowBox[{"exportPath", ",", "report"}], "]"}], ";"}], "\n", 
@@ -266,18 +335,17 @@ this script!\>\"", "]"}], ";", "\[IndentingNewLine]",
     RowBox[{"Print", "[", 
      RowBox[{"\"\<Success! Report saved to: \>\"", "<>", "exportPath"}], 
      "]"}], ";"}]}]}]], "Input",
- CellChangeTimes->{{3.981686652002146*^9, 3.981686652002146*^9}, {
-  3.9816868997737217`*^9, 3.981686904901903*^9}},
+ CellChangeTimes->{{3.981687945028139*^9, 3.981687945028139*^9}},
  CellLabel->
-  "In[178]:=",ExpressionUUID->"77cd0572-85b9-bc4a-8716-dadc701a80df"],
+  "In[275]:=",ExpressionUUID->"b181ca5f-b71d-eb42-960a-45f3cb650125"],
 
 Cell[BoxData["\<\"Success! Report saved to: \
 C:\\\\Users\\\\izzyk\\\\OneDrive\\\\Documents\\\\GitHub\\\\compressed-sensing\
 \\\\Comparison_Report.pdf\"\>"], "Print",
- CellChangeTimes->{3.9816868535934143`*^9, 3.981687147683193*^9},
+ CellChangeTimes->{3.9816881241439724`*^9, 3.981688952694235*^9},
  CellLabel->
   "During evaluation of \
-In[178]:=",ExpressionUUID->"5a1e3d74-9603-274e-9a67-3526a1a0b82b"]
+In[275]:=",ExpressionUUID->"2e35fd9e-5886-a942-840b-23c150bb7648"]
 }, Open  ]]
 },
 WindowSize->{960, 472},
@@ -298,8 +366,8 @@ CellTagsIndex->{}
 (*NotebookFileOutline
 Notebook[{
 Cell[CellGroupData[{
-Cell[580, 22, 9709, 249, 847, "Input",ExpressionUUID->"77cd0572-85b9-bc4a-8716-dadc701a80df"],
-Cell[10292, 273, 338, 6, 22, "Print",ExpressionUUID->"5a1e3d74-9603-274e-9a67-3526a1a0b82b"]
+Cell[580, 22, 12170, 317, 1170, "Input",ExpressionUUID->"b181ca5f-b71d-eb42-960a-45f3cb650125"],
+Cell[12753, 341, 338, 6, 22, "Print",ExpressionUUID->"2e35fd9e-5886-a942-840b-23c150bb7648"]
 }, Open  ]]
 }
 ]
