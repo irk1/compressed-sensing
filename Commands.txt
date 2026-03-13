@@ -1,0 +1,54 @@
+ Gemini said
+
+This Master README provides the definitive guide to your high-performance, 16-bit Compressed Sensing engine. It is designed to live alongside your CSNEW-Image_Gen.py and settings.json to ensure you never lose track of the specific optimizations for your dual-Xeon server.
+🛠 Command Reference
+Action	Command	Use Case
+Single Upscale	./CSNEW-Image_Gen <file.dng>	Process one image using settings.json values.
+Batch Upscale	./CSNEW-Image_Gen --batch <directory>	Process a folder of 100+ images for production.
+Single Test	./CSNEW-Image_Gen --test <file.dng>	Generate 9 variations of one image to find best settings.
+Folder Training	./CSNEW-Image_Gen --test <directory>	Run the 9-way parameter sweep on an entire folder.
+⚙️ The settings.json Architecture
+
+Your settings act as the "brain" for the math solver. Since we are using 32-bit Float precision, these values are extremely sensitive.
+
+    LAMBDA_MIN (Sparsity): Controls edge detection.
+
+        Lower (1e-6): Crisper edges, higher noise.
+
+        Higher (1e-4): Cleaner image, potential loss of micro-texture.
+
+    TV_WEIGHT (Denoising): Controls the smoothness of gradients.
+
+        Lower (0.001): Preserves grain/film-like texture.
+
+        Higher (0.005): Aggressive noise reduction.
+
+    MAX_THREADS (40): Fully saturates both Xeon CPUs.
+
+    MAX_RAM_GB (30): The "Safety Gate." If the server nears 30GB of RAM usage, it pauses new tiles to prevent an OOM (Out of Memory) crash.
+
+🏗 High-Performance Workflow
+1. The Calibration Phase (Training)
+
+Before running 100 images, you must calibrate for your sensor (ISO/Lighting).
+
+    Put 3-5 representative images in a folder.
+
+    Run: ./CSNEW-Image_Gen --test ./calibration_folder/.
+
+    Examine the 9 output TIFs for each. Look for the filename suffix (e.g., _L1e-05_T0.002) that looks best.
+
+    Update your settings.json with those exact values.
+
+2. The Production Phase (Batching)
+
+Once calibrated, use tmux to run the heavy lifting without needing a constant PuTTY connection.
+
+    tmux new -s prod_run
+
+    ./CSNEW-Image_Gen --batch /srv/pool/input_dngs/
+
+    Press Ctrl+B, then D to detach.
+
+    Monitor: Run htop to see all 40 cores at 100%.
+

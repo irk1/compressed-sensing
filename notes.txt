@@ -1,3 +1,31 @@
 have it generate the dataset by specifying a random collection of pixels where avg difference is no greater then x pixels
 have program find probable pixel between any 2 adjacent pixels (use usaf photo resolution thingy) compare to finding an avg value between any 2 adjacent pixels
   
+why so much image noise when upscaling
+
+
+  1. Primary Operation Commands
+Command	Action
+./CSNEW-Image_Gen <file_path>	Production Mode: Processes a single image (JPG, PNG, TIF) using the current settings.json.
+./CSNEW-Image_Gen --train <dir>	Training Mode: Iterates through all images in a folder, testing multiple λ and TV weights.
+./CSNEW-Image_Gen --train <dir> --use-noise	Noisy Training: Adds professional ISO noise models to the training images to find better de-noising parameters.
+2. Background & Session Management
+
+
+    Start Background Training: nohup ./CSNEW-Image_Gen --train "test images/" > training.log 2>&1 &
+
+    Watch Progress Live: tail -f training.log
+
+    Find if it's running: pgrep -f CSNEW-Image_Gen
+
+    Stop the program gracefully: kill -2 $(pgrep -f CSNEW-Image_Gen)
+
+3. JSON Control Parameters (settings.json)
+
+These aren't "terminal commands," but they are the commands you give to the engine's brain. You can modify these mid-run (though they only take effect when a new image or trial starts).
+Key	Suggested Value	Purpose
+"MAX_THREADS"	8	Number of CPU cores to use.
+"MAX_RAM_GB"	32	Pauses training if system available RAM drops below this.
+"TILE_SIZE"	64	Size of the math blocks (64×64). Larger is more accurate but uses much more RAM.
+"LAMBDA_MIN"	0.0001	Sparsity strength (The "Compressed" part of the sensing).
+"TV_WEIGHT"	0.01	Total Variation (The "Smoothing" part that removes noise).

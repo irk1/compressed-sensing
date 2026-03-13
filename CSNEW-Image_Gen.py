@@ -4,67 +4,71 @@ import numpy as np
 import cv2
 import cvxpy as cp
 import json
-import pickle
 import time
 import signal
 import psutil
-import datetime
-import csv
-import shutil
+import rawpy
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
 
-# 1. STOP THE OSQP ALGEBRA ERROR (Must be before cvxpy import)
+# 1. HARDWARE & SIGNAL OPTIMIZATION
 os.environ["CVXPY_SOLVER_MAP_IGNORE"] = "OSQP"
-
-# --- GLOBALS & SIGNALS ---
 KEEP_RUNNING = True
 SETTINGS_FILE = "settings.json"
-CHECKPOINT_FILE = "reconstruction_checkpoint.pkl"
-TRAIN_CACHE = "training_cache"
-MAX_CACHE_GB = 200  
-MIN_DRIVE_FREE_GB = 10 
 
 def graceful_exit(signum, frame):
     global KEEP_RUNNING
-    print("\n[!] STOP SIGNAL RECEIVED. Cleaning up current tile and exiting...")
+    print("\n[!] STOP SIGNAL RECEIVED. Finishing current high-precision tiles...")
     KEEP_RUNNING = False
 
 signal.signal(signal.SIGINT, graceful_exit)
 
-# --- UTILITIES ---
-def get_ram_usage():
-    try:
-        process = psutil.Process(os.getpid())
-        return process.memory_info().rss / 1024 / 1024
-    except: return 0.0
-
+# --- SETTINGS LOADER ---
 def load_settings():
+    defaults = {
+        "SCALE_FACTOR": 2, 
+        "TILE_SIZE": 64, 
+        "OVERLAP": 12, 
+        "LAMBDA_MIN": 1e-5, 
+        "TV_WEIGHT": 0.002, 
+        "MAX_THREADS": 40, 
+        "MAX_RAM_GB": 30
+    }
     if os.path.exists(SETTINGS_FILE):
-        with open(SETTINGS_FILE, 'r') as f:
-            return json.load(f)
-    return {"SCALE_FACTOR": 2, "TILE_SIZE": 64, "OVERLAP": 4, "LAMBDA_MIN": 1e-4, "TV_WEIGHT": 0.01}
+        try:
+            with open(SETTINGS_FILE, 'r') as f:
+                user_cfg = json.load(f)
+                return {**defaults, **user_cfg}
+        except:
+            return defaults
+    return defaults
 
-def check_disk_usage(incoming_gb=0):
-    usage = shutil.disk_usage(os.getcwd())
-    free_gb = usage.free / (1024**3)
-    cache_gb = 0
-    if os.path.exists(TRAIN_CACHE):
-        for dirpath, _, filenames in os.walk(TRAIN_CACHE):
-            for f in filenames:
-                cache_gb += os.path.getsize(os.path.join(dirpath, f))
-    cache_gb /= (1024**3)
-    return (free_gb - incoming_gb) > MIN_DRIVE_FREE_GB and (cache_gb + incoming_gb) < MAX_CACHE_GB
+# --- HIGH-BIT DEPTH LOADING (FLOAT32 COMPATIBILITY) ---
+def load_image(path):
+    try:
+        if path.lower().endswith(('.dng', '.nef', '.cr2', '.arw', '.orf')):
+            with rawpy.imread(path) as raw:
+                try:
+                    rgb = raw.postprocess(
+                        use_camera_wb=True, 
+                        no_auto_bright=False, 
+                        bright=1.0, 
+                        output_bps=16, 
+                        demosaic_algorithm=rawpy.DemosaicAlgorithm.DHT
+                    )
+                except:
+                    rgb = raw.postprocess(use_camera_wb=True, no_auto_bright=False, output_bps=16)
+                
+                bgr_16 = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                return bgr_16.astype(np.float32) / 65535.0
+        else:
+            bgr = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+            if bgr is None: return None
+            return bgr.astype(np.float32) / (255.0 if bgr.dtype == np.uint8 else 65535.0)
+    except Exception as e:
+        print(f"[ERROR] Loading Failed: {e}"); return None
 
-# --- PHOTOGRAPHIC NOISE MODEL ---
-def add_professional_noise(image, iso_level=1600):
-    """Simulates signal-dependent photon shot noise and electronic read noise."""
-    img_float = image.astype(np.float32) / 255.0
-    shot_intensity = (iso_level / 100) * 0.002
-    shot_noise = np.random.normal(0, 1, image.shape) * np.sqrt(img_float + 1e-6) * shot_intensity
-    read_noise = np.random.normal(0, 0.005, image.shape)
-    noisy_img = img_float + shot_noise + read_noise
-    return np.clip(noisy_img * 255.0, 0, 255).astype(np.uint8)
-
-# --- CORE MATH ---
+# --- THE "HEAVY" SOLVER (5,000 ITERATIONS) ---
 def get_dct_matrix(n):
     d = np.zeros((n, n))
     for k in range(n):
@@ -72,153 +76,119 @@ def get_dct_matrix(n):
             d[k, i] = np.sqrt(1/n) if k == 0 else np.sqrt(2/n) * np.cos(np.pi * k * (2*i + 1) / (2*n))
     return d
 
-def solve_core(lr_data, config):
-    h, w = lr_data.shape
-    scale = config.get("SCALE_FACTOR", 2)
+def solve_tile(args):
+    lr_tile, scale, l_min, tv_w = args
+    h, w = lr_tile.shape
     hh, ww = h * scale, w * scale
-    lr_norm = lr_data.astype(np.float32) / 255.0
-    
-    if np.std(lr_norm) < 0.005: # Flat area optimization
-        return cv2.resize(lr_data, (ww, hh), interpolation=cv2.INTER_CUBIC)
-
     D_h, D_w = get_dct_matrix(hh), get_dct_matrix(ww)
     X_dct = cp.Variable((hh, ww))
     img_rec = D_h.T @ X_dct @ D_w
     
-    # Adapt tolerance if we are currently training with noise
-    tol = 0.02 if config.get("_is_noisy_trial", False) else 0.01
-    
     constraints = [
-        cp.abs(img_rec[::scale, ::scale] - lr_norm) <= tol,
+        cp.abs(img_rec[::scale, ::scale] - lr_tile) <= 0.001,
         img_rec >= 0, img_rec <= 1
     ]
-    loss = (cp.norm(X_dct, 1) * config["LAMBDA_MIN"]) + (cp.tv(img_rec) * config["TV_WEIGHT"])
+    loss = (cp.norm(X_dct, 1) * l_min) + (cp.tv(img_rec) * tv_w)
     prob = cp.Problem(cp.Minimize(loss), constraints)
     
     try:
-        prob.solve(solver=cp.ECOS, max_iters=500, abstol=1e-3, reltol=1e-3)
-        return np.clip(img_rec.value * 255.0, 0, 255) if X_dct.value is not None else cv2.resize(lr_data, (ww, hh))
+        prob.solve(solver=cp.ECOS, max_iters=5000, abstol=1e-8)
+        if X_dct.value is not None:
+            return np.clip(img_rec.value, 0, 1).astype(np.float32)
+        return cv2.resize(lr_tile, (ww, hh), interpolation=cv2.INTER_LANCZOS4)
     except:
-        return cv2.resize(lr_data, (ww, hh))
+        return cv2.resize(lr_tile, (ww, hh), interpolation=cv2.INTER_LANCZOS4)
 
-# --- TILING ENGINE ---
-def process_full_image(img_in, config, silent=True):
-    H, W = img_in.shape[:2]
-    C = 1 if len(img_in.shape) == 2 else img_in.shape[2]
-    scale, ts = config["SCALE_FACTOR"], config["TILE_SIZE"]
-    stride = ts - config["OVERLAP"]
+# --- CORE ENGINE ---
+def process_full(img_float, config, l_override=None, t_override=None):
+    l_min = l_override if l_override is not None else config["LAMBDA_MIN"]
+    tv_w = t_override if t_override is not None else config["TV_WEIGHT"]
     
-    output = np.zeros((H * scale, W * scale, C) if C > 1 else (H * scale, W * scale), dtype=np.uint8)
-    
-    for y in range(0, H - ts + 1, stride):
-        if not KEEP_RUNNING: break
-        for x in range(0, W - ts + 1, stride):
-            if not KEEP_RUNNING: break
-            tile = img_in[y:y+ts, x:x+ts]
-            if C > 1:
-                for c in range(C):
-                    res = solve_core(tile[:,:,c], config)
-                    output[y*scale:(y+ts)*scale, x*scale:(x+ts)*scale, c] = res.astype(np.uint8)
-            else:
-                res = solve_core(tile, config)
-                output[y*scale:(y+ts)*scale, x*scale:(x+ts)*scale] = res.astype(np.uint8)
-    return output
+    lab_32f = cv2.cvtColor(img_float, cv2.COLOR_BGR2Lab)
+    channels = cv2.split(lab_32f)
+    up_chans = []
+    max_ram_bytes = config["MAX_RAM_GB"] * (1024**3)
 
-# --- TRAINING SUITE ---
-def run_training(input_dir, use_noise=False):
-    print(f"[*] TRAINING INITIATED | ISO Noise: {'ON' if use_noise else 'OFF'}")
-    if not os.path.exists(TRAIN_CACHE): os.makedirs(TRAIN_CACHE)
-    
-    image_files = [f for f in os.listdir(input_dir) if f.lower().endswith(('.jpg', '.png', '.tif'))]
-    lambdas = [1e-4, 5e-5, 1e-5]
-    tvs = [0.01, 0.05, 0.1]
-    
-    results = []
-    best_psnr, best_cfg = -1, {}
+    for chan in channels:
+        H, W = chan.shape
+        scale, ts = config["SCALE_FACTOR"], config["TILE_SIZE"]
+        stride = ts - config["OVERLAP"]
+        
+        work, pos = [], []
+        for y in range(0, H - ts + 1, stride):
+            for x in range(0, W - ts + 1, stride):
+                work.append((chan[y:y+ts, x:x+ts], scale, l_min, tv_w))
+                pos.append((y*scale, x*scale))
 
-    try:
-        for fname in image_files:
-            if not KEEP_RUNNING: break
-            orig = cv2.imread(os.path.join(input_dir, fname))
-            if orig is None: continue
-            
-            # Disk space check (roughly 2 copies of downsized image)
-            if not check_disk_usage((orig.nbytes / 4) * 2 / (1024**3)):
-                print(f"[!] Storage limit reached for {fname}. Skipping.")
-                continue
+        out = np.zeros((H * scale, W * scale), dtype=np.float32)
+        with ProcessPoolExecutor(max_workers=config["MAX_THREADS"]) as ex:
+            futures = []
+            for item in work:
+                while psutil.virtual_memory().available < (psutil.virtual_memory().total - max_ram_bytes):
+                    time.sleep(0.5)
+                if not KEEP_RUNNING: break
+                futures.append(ex.submit(solve_tile, item))
 
-            # Establish training modes for this image
-            modes = [("Clean", False)]
-            if use_noise: modes.append(("ISO_Noisy", True))
+            for i, f in enumerate(futures):
+                y, x = pos[i]
+                out[y:y+(ts*scale), x:x+(ts*scale)] = f.result()
+        up_chans.append(out)
 
-            for mode_name, is_noisy in modes:
-                lr = cv2.resize(orig, (orig.shape[1]//2, orig.shape[0]//2), interpolation=cv2.INTER_AREA)
-                if is_noisy: lr = add_professional_noise(lr)
-                
-                tmp_path = os.path.join(TRAIN_CACHE, f"t_{mode_name}_{fname}")
-                cv2.imwrite(tmp_path, lr)
-                lr_img = cv2.imread(tmp_path)
+    merged = cv2.merge(up_chans)
+    bgr_32f = cv2.cvtColor(merged, cv2.COLOR_Lab2BGR)
+    bgr_8 = (np.clip(bgr_32f, 0, 1) * 255).astype(np.uint8)
+    cleaned_8 = cv2.fastNlMeansDenoisingColored(bgr_8, None, 3, 3, 7, 21)
+    return (cleaned_8.astype(np.uint16) * 257)
 
-                print(f"[*] Analyzing {fname} ({mode_name})")
-
-                for l in lambdas:
-                    for tv in tvs:
-                        if not KEEP_RUNNING: break
-                        cfg = {"SCALE_FACTOR": 2, "TILE_SIZE": 64, "OVERLAP": 4, 
-                               "LAMBDA_MIN": l, "TV_WEIGHT": tv, "_is_noisy_trial": is_noisy}
-                        
-                        recon = process_full_image(lr_img, cfg)
-                        
-                        # PSNR check against the high-res original ground truth
-                        ref = cv2.resize(orig, (recon.shape[1], recon.shape[0]))
-                        mse = np.mean((ref.astype(np.float32) - recon.astype(np.float32))**2)
-                        psnr = 20 * np.log10(255.0 / np.sqrt(mse)) if mse > 0 else 0
-                        
-                        results.append([fname, mode_name, l, tv, round(psnr, 4)])
-                        if psnr > best_psnr:
-                            best_psnr, best_cfg = psnr, cfg
-                            print(f"  > NEW BEST: {psnr:.2f}dB (L={l}, TV={tv})")
-
-        if best_cfg:
-            best_cfg.pop("_is_noisy_trial", None) # Remove internal flag
-            with open(SETTINGS_FILE, 'w') as f:
-                json.dump(best_cfg, f, indent=4)
-            
-            with open("training_log.csv", 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['File', 'Mode', 'Lambda', 'TV', 'PSNR'])
-                writer.writerows(results)
-            print(f"[*] Training finished. settings.json updated with top performer.")
-
-    finally:
-        shutil.rmtree(TRAIN_CACHE, ignore_errors=True)
+# --- RESTORED FOLDER TESTING LOGIC ---
+def run_testing_mode(img_float, config, base_path):
+    print(f"[!] TEST GRID: Generating 9 variations for {os.path.basename(base_path)}...")
+    lambdas = [1e-6, 1e-5, 1e-4]
+    tvs = [0.001, 0.002, 0.005]
+    for l_val in lambdas:
+        for t_val in tvs:
+            if not KEEP_RUNNING: return
+            print(f"  [>] Solving: Lambda={l_val}, TV={t_val}")
+            res = process_full(img_float, config, l_val, t_val)
+            cv2.imwrite(f"{base_path}_L{l_val}_T{t_val}.tif", res, [cv2.IMWRITE_TIFF_COMPRESSION, 32946])
 
 # --- MAIN ---
 def main():
     args = sys.argv[1:]
-    if "--train" in args:
-        target_dir = args[args.index("--train") + 1]
-        use_noise = "--use-noise" in args
-        run_training(target_dir, use_noise=use_noise)
-        return
+    config = load_settings()
+    valid_exts = ('.dng', '.nef', '.cr2', '.arw', '.jpg', '.png', '.tif')
 
-    if args:
-        img_path = args[0]
-        if not os.path.exists(img_path):
-            print(f"[!] File not found: {img_path}"); return
+    if "--test" in args:
+        path = args[args.index("--test") + 1]
+        if os.path.isdir(path):
+            files = sorted([os.path.join(path, f) for f in os.listdir(path) if f.lower().endswith(valid_exts)])
+            print(f"[*] FOLDER TRAINING: Processing {len(files)} files...")
+            for f in files:
+                if not KEEP_RUNNING: break
+                img = load_image(f)
+                if img is not None: run_testing_mode(img, config, os.path.splitext(f)[0])
+        else:
+            img = load_image(path)
+            if img is not None: run_testing_mode(img, config, os.path.splitext(path)[0])
             
-        config = load_settings()
-        img = cv2.imread(img_path)
-        print(f"[*] Processing {img_path} with settings: {config}")
-        
-        start_t = time.time()
-        final = process_full_image(img, config)
-        
-        out_name = "FINAL_RECONSTRUCTION.png"
-        cv2.imwrite(out_name, final)
-        print(f"[*] Done. Saved to {out_name} in {((time.time()-start_t)/60):.2f}m")
+    elif "--batch" in args:
+        batch_dir = args[args.index("--batch") + 1]
+        files = sorted([os.path.join(batch_dir, f) for f in os.listdir(batch_dir) if f.lower().endswith(valid_exts) and "_upscaled" not in f])
+        for f in files:
+            if not KEEP_RUNNING: break
+            print(f"[*] BATCH RUN: {os.path.basename(f)}")
+            img = load_image(f)
+            if img is not None:
+                res = process_full(img, config)
+                cv2.imwrite(f"{os.path.splitext(f)[0]}_upscaled.tif", res, [cv2.IMWRITE_TIFF_COMPRESSION, 32946])
+    elif args:
+        img = load_image(args[0])
+        if img is not None:
+            res = process_full(img, config)
+            cv2.imwrite(f"{os.path.splitext(args[0])[0]}_upscaled.tif", res, [cv2.IMWRITE_TIFF_COMPRESSION, 32946])
     else:
-        print("Commands:\n  Train:   python script.py --train <directory> [--use-noise]\n  Process: python script.py <image_file>")
+        print("Usage: ./CSNEW-Image_Gen --test <file/dir> | --batch <dir> | <file>")
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()
