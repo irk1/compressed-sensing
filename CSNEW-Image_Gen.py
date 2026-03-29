@@ -9,7 +9,33 @@ import signal
 import psutil
 import rawpy
 import multiprocessing
+import datetime
 from concurrent.futures import ProcessPoolExecutor
+
+# --- LIVE PERFORMANCE LOGGER ---
+class LiveLogger:
+    def __init__(self, filename="training_results.csv"):
+        self.filename = filename
+        # Initialize header if file doesn't exist
+        if not os.path.exists(self.filename):
+            with open(self.filename, 'w', encoding="utf-8") as f:
+                f.write("Timestamp_UTC,File_Name,Lambda,TV_Weight,Duration_Sec,Status\n")
+                f.flush()
+                os.fsync(f.fileno())
+
+    def log_entry(self, file_name, l_val, t_val, duration, status="SUCCESS"):
+        utc_now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        # Record the time spent per image for efficiency analysis
+        line = f"{utc_now},{file_name},{l_val},{t_val},{duration:.2f},{status}\n"
+        
+        with open(self.filename, 'a', encoding="utf-8") as f:
+            f.write(line)
+            # CRITICAL: Bypass OS cache to ensure 381-hour reliability
+            f.flush()
+            os.fsync(f.fileno())
+
+# Global Instance
+logger = LiveLogger()
 
 # 1. HARDWARE & SIGNAL OPTIMIZATION
 os.environ["CVXPY_SOLVER_MAP_IGNORE"] = "OSQP"
@@ -43,7 +69,7 @@ def load_settings():
             return defaults
     return defaults
 
-# --- HIGH-BIT DEPTH LOADING (FLOAT32 COMPATIBILITY) ---
+# --- HIGH-BIT DEPTH LOADING ---
 def load_image(path):
     try:
         if path.lower().endswith(('.dng', '.nef', '.cr2', '.arw', '.orf')):
@@ -68,7 +94,7 @@ def load_image(path):
     except Exception as e:
         print(f"[ERROR] Loading Failed: {e}"); return None
 
-# --- THE "HEAVY" SOLVER (5,000 ITERATIONS) ---
+# --- THE SOLVER ---
 def get_dct_matrix(n):
     d = np.zeros((n, n))
     for k in range(n):
@@ -140,17 +166,27 @@ def process_full(img_float, config, l_override=None, t_override=None):
     cleaned_8 = cv2.fastNlMeansDenoisingColored(bgr_8, None, 3, 3, 7, 21)
     return (cleaned_8.astype(np.uint16) * 257)
 
-# --- RESTORED FOLDER TESTING LOGIC ---
+# --- TESTING MODE ---
 def run_testing_mode(img_float, config, base_path):
-    print(f"[!] TEST GRID: Generating 9 variations for {os.path.basename(base_path)}...")
+    fname = os.path.basename(base_path)
+    print(f"[!] TEST GRID: Generating 9 variations for {fname}...")
     lambdas = [1e-6, 1e-5, 1e-4]
     tvs = [0.001, 0.002, 0.005]
     for l_val in lambdas:
         for t_val in tvs:
-            if not KEEP_RUNNING: return
+            if not KEEP_RUNNING: 
+                logger.log_entry(fname, l_val, t_val, 0, "STOPPED_BY_USER")
+                return
+            
             print(f"  [>] Solving: Lambda={l_val}, TV={t_val}")
-            res = process_full(img_float, config, l_val, t_val)
-            cv2.imwrite(f"{base_path}_L{l_val}_T{t_val}.tif", res, [cv2.IMWRITE_TIFF_COMPRESSION, 32946])
+            start_time = time.time()
+            try:
+                res = process_full(img_float, config, l_val, t_val)
+                cv2.imwrite(f"{base_path}_L{l_val}_T{t_val}.tif", res, [cv2.IMWRITE_TIFF_COMPRESSION, 32946])
+                duration = time.time() - start_time
+                logger.log_entry(fname, l_val, t_val, duration, "SUCCESS")
+            except Exception as e:
+                logger.log_entry(fname, l_val, t_val, time.time()-start_time, f"FAILED: {str(e)}")
 
 # --- MAIN ---
 def main():
@@ -177,15 +213,19 @@ def main():
         for f in files:
             if not KEEP_RUNNING: break
             print(f"[*] BATCH RUN: {os.path.basename(f)}")
+            start_time = time.time()
             img = load_image(f)
             if img is not None:
                 res = process_full(img, config)
                 cv2.imwrite(f"{os.path.splitext(f)[0]}_upscaled.tif", res, [cv2.IMWRITE_TIFF_COMPRESSION, 32946])
+                logger.log_entry(os.path.basename(f), config["LAMBDA_MIN"], config["TV_WEIGHT"], time.time()-start_time, "SUCCESS")
     elif args:
         img = load_image(args[0])
         if img is not None:
+            start_time = time.time()
             res = process_full(img, config)
             cv2.imwrite(f"{os.path.splitext(args[0])[0]}_upscaled.tif", res, [cv2.IMWRITE_TIFF_COMPRESSION, 32946])
+            logger.log_entry(os.path.basename(args[0]), config["LAMBDA_MIN"], config["TV_WEIGHT"], time.time()-start_time, "SUCCESS")
     else:
         print("Usage: ./CSNEW-Image_Gen --test <file/dir> | --batch <dir> | <file>")
 

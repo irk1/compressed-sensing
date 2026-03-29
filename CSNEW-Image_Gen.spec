@@ -1,18 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import copy_metadata
 
-hiddenimports = ['cvxpy.interface.numpy_interface', 'cvxpy.cvxcore.python.canonInterface', 'rawpy', 'skimage.metrics']
-hiddenimports += collect_submodules('cvxpy')
-hiddenimports += collect_submodules('rawpy')
-hiddenimports += collect_submodules('skimage')
+datas = []
+datas += copy_metadata('cvxpy')
 
 
 a = Analysis(
     ['CSNEW-Image_Gen.py'],
     pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=hiddenimports,
+    datas=datas,
+    hiddenimports=['cvxpy.interface.numpy_interface.ndarray_interface'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
