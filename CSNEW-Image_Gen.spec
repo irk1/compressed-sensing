@@ -1,28 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_submodules
 
-datas = []
-binaries = []
-hiddenimports = []
-tmp_ret = collect_all('cvxpy')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('psutil')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('imagecodecs')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('tifffile')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('rawpy')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('opencv-python')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+hiddenimports = ['rawpy', 'tifffile']
+hiddenimports += collect_submodules('cvxpy')
+hiddenimports += collect_submodules('scipy')
 
 
 a = Analysis(
     ['CSNEW-Image_Gen.py'],
     pathex=[],
-    binaries=binaries,
-    datas=datas,
+    binaries=[],
+    datas=[],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
