@@ -597,3 +597,4 @@ dist/CSNEW-Image_Gen.exe
 build/CSNEW-Image_Gen/base_library.zip
 2025-11-08 19-36-49 (C,S1)6PB042129-1.psd
 training_log.csv
+*.pkg

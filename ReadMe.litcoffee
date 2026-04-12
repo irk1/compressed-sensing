@@ -34,41 +34,71 @@ To avoid the precision loss inherent in 8-bit or 16-bit integer processing, the 
 
 ---
 
-### Development and Architecture
+### Architecture & Portability
 
-* Core Logic: Python 3.10+
-* Optimization Solver: CVXPY with the ECOS (Embedded Conic Solver) backend.
-* Image IO: `rawpy` (LibRaw) for DNG/RAW decoding and OpenCV for color space transformations.
-* Parallelization: `ProcessPoolExecutor` utilizing a Hardware Safety Gate to monitor system RAM before submitting new optimization tiles.
+CSNEW-Image_Gen is designed for Zero-Footprint Deployment on air-gapped servers.
+
+* Self-Contained Binary: Statically bundled using PyInstaller. The executable contains the Python interpreter, ECOS solvers, and all required math libraries.
+### 
+* Embedded ExifTool: Includes a portable Perl-based ExifTool environment. It automatically copies ColorMatrix, AsShotWhiteValue, and ForwardMatrix from the source RAW to the upscaled DNG.
+### 
+* Photogrammetry Scaling: Mathematically scales FocalPlaneXResolution and FocalPlaneYResolution based on the SCALE_FACTOR to ensure 1:1 physical sensor accuracy in 3D reconstruction suites.
+### 
+* Hardware Safety Gate: Real-time monitoring of system RAM (via psutil) pauses processing if free memory falls below the user-defined threshold in settings.json.
+### 
 
 ---
 
 ### Supported File Formats
 
-The engine utilizes `rawpy` and OpenCV to maintain a high-precision pipeline from sensor to output.
+The engine utilizes `rawpy` and `numpy2dng` to maintain a high-precision 16-bit signal chain from sensor to final export.
 
+#### Supported Input Formats:
 * Digital Negatives (RAW): `.dng`, `.nef`, `.cr2`, `.arw`, `.orf`.
-  * Note: RAW files are processed using DHT Demosaicing at 16-bits per channel.
+
 * Standard Raster: `.tif` / `.tiff` (preferred), `.png`, `.jpg`.
-* Output: Always exports to 16-bit Uncompressed TIFF to preserve reconstruction data.
+
+
+#### Output: 
+* Always exports to 16-bit Uncompressed Digital Negative (`.dng`). This preserves reconstruction data in a format compatible with Adobe Camera Raw, while maintaining original camera color matrices and white balance via internal metadata injection.
 
 ---
 
 ### How to Use
 
-Command Line Interface
+The engine is distributed as a standalone Linux binary—no local Python or library installation is required on the server.
 
-`./CSNEW-Image_Gen [file]`
-Process a single image using `settings.json` parameters.
+`./CSNEW-Image_Gen [file]
+`
+Process a single image using settings.json parameters.
 
-`./CSNEW-Image_Gen --batch [directory]`
+`./CSNEW-Image_Gen --batch [directory]
+`
 Production mode: Processes all images in a directory.
 
-`./CSNEW-Image_Gen --test [file/dir]`
-Training Mode: Generates a 9-way parameter sweep for tuning.
+`./CSNEW-Image_Gen --test [file/dir]
+`
+Training Mode: Generates a 9-way parameter sweep grid to find the optimal λ and γ. Outputs are saved as labeled DNGs (e.g., `_L1e-05_T0.002.dng`) for direct evaluation in Adobe Camera Raw.
 
 ---
+### Configuration
+The engine requires a `settings.json` in the execution directory to define hardware and math limits:
 
+```
+{
+    "SCALE_FACTOR": 2,
+    "TILE_SIZE": 64,
+    "OVERLAP": 12,
+    "LAMBDA_MIN": 1e-05,
+    "TV_WEIGHT": 0.002,
+    "MAX_THREADS": 40,
+    "MAX_RAM_GB": 30
+}
+```
+
+
+
+---
 ### Analytics and Scoring
 
 The program includes an analytical suite to quantify reconstruction quality rather than relying on subjective observation.
@@ -77,13 +107,16 @@ The program includes an analytical suite to quantify reconstruction quality rath
 When running in `--test` mode, the program generates a grid based on variable $\lambda$ and $\gamma$.
 
 * Sparsity Sweep: Tests values $10^{-6}$, $10^{-5}$, $10^{-4}$ to determine the sensor Texture-to-Artifact breakpoint.
+### 
+
 * TV Sweep: Tests levels of edge-preserving smoothing $0.001$, $0.002$, $0.005$.
 
 #### 2. Scoring Metrics
 The engine calculates fidelity using two primary metrics:
 
-* SSIM (Structural Similarity Index): Measures the degradation of structural information between the original sensor data and the reconstructed result. Target range: $0.975$ to $0.992$.
-* Convergence Residuals: If the ECOS solver fails to reach the specified tolerance within 5,000 iterations, the program identifies the tile as Low Confidence and applies a high-fidelity Lanczos4 fallback.
+* SSIM (Structural Similarity Index): Measures the degradation of structural information between the original sensor data and the reconstructed result. Target range: $0.975$ to $0.992$.  
+###  
+* Convergence Residuals: If the ECOS solver fails to reach the specified tolerance within 5,000 iterations, the program identifies the tile as Low Confidence and applies a high-fidelity Lanczos4 fallback.  
 
 ---
 
