@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_submodules
 
-hiddenimports = ['rawpy', 'tifffile']
+hiddenimports = ['rawpy', 'tifffile', 'psutil']
 hiddenimports += collect_submodules('cvxpy')
 hiddenimports += collect_submodules('scipy')
 

@@ -157,3 +157,8 @@ The program generates a spatial divergence map using the Jet Colormap. This allo
     * Side-by-Side Visuals: The reference image vs. the reconstruction.
     * Normalized Difference Map: Highlighting the exact spatial location of residuals.
     * Interpretation Glossary: Definitions for each metric to assist in parameter tuning for the next batch run.
+
+
+
+
+    [![Reconstruction Report Preview](Comparison_Report.jpg)](Comparison_Report.jpg)

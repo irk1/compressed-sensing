@@ -61,7 +61,7 @@ class Silence:
         os.close(self.null_fd); os.close(self.save_fds[0]); os.close(self.save_fds[1])
 
 # =================================================================
-# 2. DNG WRITER ENGINE (v5.3 - TRUE BAYER CFA)
+# 2. DNG WRITER ENGINE (v5.3.5 - HYBRID READY)
 # =================================================================
 class Tag:
     NewSubfileType = (254, 4); ImageWidth = (256, 4); ImageLength = (257, 4)
@@ -71,7 +71,7 @@ class Tag:
     DNGBackwardVersion = (50707, 1); UniqueCameraModel = (50708, 2)
     ColorMatrix1 = (50721, 10); AsShotNeutral = (50728, 5)
     CalibrationIlluminant1 = (50778, 3); BlackLevel = (50714, 4); WhiteLevel = (50717, 4)
-    CFARepeatPatternDim = (33421, 3); CFAPattern = (33422, 1)
+    BlackLevelRepeatDim = (50713, 3); CFARepeatPatternDim = (33421, 3); CFAPattern = (33422, 1)
 
 class dngTag:
     def __init__(self, tag_def, value):
@@ -111,16 +111,18 @@ class MonolithDNGWriter:
             dngTag(Tag.BitsPerSample, [16]), dngTag(Tag.Compression, [1]),
             dngTag(Tag.PhotometricInterpretation, [32803]), 
             dngTag(Tag.SamplesPerPixel, [1]),
-            dngTag(Tag.Software, "Irk_Monolith_v5.3_CFA"), 
-            dngTag(Tag.DNGVersion, [1, 7, 1, 0]),
-            dngTag(Tag.DNGBackwardVersion, [1, 6, 0, 0]),
+            dngTag(Tag.Software, "Irk_Monolith_v5.3.5_Hybrid"), 
+            dngTag(Tag.DNGVersion, [1, 4, 0, 0]), 
+            dngTag(Tag.DNGBackwardVersion, [1, 3, 0, 0]), 
             dngTag(Tag.Orientation, [1]), dngTag(Tag.UniqueCameraModel, "Xeon_Botanical_Custom"),
             dngTag(Tag.CFARepeatPatternDim, [2, 2]),
             dngTag(Tag.CFAPattern, meta["pattern"]),
+            dngTag(Tag.BlackLevelRepeatDim, [2, 2]),
             dngTag(Tag.BlackLevel, meta["black"]), 
-            dngTag(Tag.WhiteLevel, [meta["white"]]), 
+            dngTag(Tag.WhiteLevel, [meta["white"]]),
+            dngTag(Tag.AsShotNeutral, meta.get("as_shot_neutral", [(1, 1), (1, 1), (1, 1)])),
             dngTag(Tag.CalibrationIlluminant1, [21]),
-            dngTag(Tag.ColorMatrix1, [(1,1), (0,1), (0,1), (0,1), (1,1), (0,1), (0,1), (0,1), (1,1)])
+            dngTag(Tag.ColorMatrix1, meta.get("color_matrix", [(1,1), (0,1), (0,1), (0,1), (1,1), (0,1), (0,1), (0,1), (1,1)]))
         ]
         
         ifd_start = 16
@@ -152,6 +154,35 @@ class MonolithDNGWriter:
 # =================================================================
 def load_image(path):
     global CAMERA_METADATA
+    ext = os.path.splitext(path)[1].lower()
+    
+    # 1. Standard RGB Image Pipeline
+    if ext in ['.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp']:
+        try:
+            if ext in ['.tif', '.tiff']:
+                img = tifffile.imread(path)
+            else:
+                img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+                if img is not None and len(img.shape) == 3:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            
+            if img is None: return None, False
+            
+            if len(img.shape) == 2:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+            elif len(img.shape) == 3 and img.shape[2] == 4:
+                img = img[:, :, :3]
+                
+            if img.dtype == np.uint8: img = img.astype(np.float32) / 255.0
+            elif img.dtype == np.uint16: img = img.astype(np.float32) / 65535.0
+            else: img = img.astype(np.float32)
+            
+            return img, False # False = Not CFA/RAW
+        except Exception as e:
+            print(f"[ERROR] Standard Image Loading Failed: {e}")
+            return None, False
+
+    # 2. True RAW / CFA Pipeline
     try:
         with rawpy.imread(path) as raw:
             bayer = raw.raw_image_visible.astype(np.float32)
@@ -165,15 +196,33 @@ def load_image(path):
             cfa_packed[:, :, 2] = bayer[1::2, 0::2]
             cfa_packed[:, :, 3] = bayer[1::2, 1::2]
             
+            pattern_raw = raw.raw_pattern.flatten().tolist()
+            pattern_dng = [1 if x == 3 else x for x in pattern_raw]
+            
+            wb = raw.camera_whitebalance
+            nr = int(10000 / wb[0]) if wb[0] > 0 else 10000
+            ng = int(10000 / wb[1]) if wb[1] > 0 else 10000
+            nb = int(10000 / wb[2]) if wb[2] > 0 else 10000
+
+            try:
+                xyz_cam = raw.rgb_xyz_matrix[:3, :3]
+                if np.sum(np.abs(xyz_cam)) < 0.1: xyz_cam = np.eye(3)
+            except:
+                xyz_cam = np.eye(3)
+                
+            c_mat = [(int(val * 10000), 10000) for val in xyz_cam.flatten()]
+            
             CAMERA_METADATA = {
-                "pattern": raw.raw_pattern.flatten().tolist(),
+                "pattern": pattern_dng,
                 "black": [int(x) for x in raw.black_level_per_channel],
-                "white": int(white_level)
+                "white": int(white_level),
+                "as_shot_neutral": [(nr, 10000), (ng, 10000), (nb, 10000)],
+                "color_matrix": c_mat
             }
-            return cfa_packed
+            return cfa_packed, True # True = Is CFA/RAW
     except Exception as e:
-        print(f"[ERROR] Loading Failed: {e}")
-        return None
+        print(f"[ERROR] RAW Loading Failed: {e}")
+        return None, False
 
 def get_dct_matrix(n):
     d = np.zeros((n, n))
@@ -217,7 +266,7 @@ def work_generator(H, W, ts, stride, scale, l_min, tv_w, chan_shape, config):
             yield (y, x, ts, scale, l_min, tv_w, tile_count, chan_shape)
             tile_count += 1
 
-def process_full(img_float, config, l_override=None, t_override=None):
+def process_full(img_float, is_cfa, config, l_override=None, t_override=None):
     l_min = l_override if l_override is not None else config["LAMBDA_MIN"]
     tv_w = t_override if t_override is not None else config["TV_WEIGHT"]
 
@@ -249,14 +298,22 @@ def process_full(img_float, config, l_override=None, t_override=None):
                 out[y_up:y_up+(ts*scale), x_up:x_up+(ts*scale)] = result
         up_chans.append(out); gc.collect()
 
-    out_h, out_w = H * scale * 2, W * scale * 2
-    final_bayer = np.zeros((out_h, out_w), dtype=np.float32)
-    final_bayer[0::2, 0::2] = up_chans[0]
-    final_bayer[0::2, 1::2] = up_chans[1]
-    final_bayer[1::2, 0::2] = up_chans[2]
-    final_bayer[1::2, 1::2] = up_chans[3]
-    
-    return (np.clip(final_bayer, 0, 1) * 65535).astype(np.uint16)
+    if is_cfa:
+        out_h, out_w = H * scale * 2, W * scale * 2
+        final_bayer = np.zeros((out_h, out_w), dtype=np.float32)
+        final_bayer[0::2, 0::2] = up_chans[0]
+        final_bayer[0::2, 1::2] = up_chans[1]
+        final_bayer[1::2, 0::2] = up_chans[2]
+        final_bayer[1::2, 1::2] = up_chans[3]
+        
+        white_level = CAMERA_METADATA.get("white", 65535)
+        return (np.clip(final_bayer, 0, 1) * white_level).astype(np.uint16)
+    else:
+        out_h, out_w = H * scale, W * scale
+        final_rgb = np.zeros((out_h, out_w, chans), dtype=np.float32)
+        for i in range(chans):
+            final_rgb[:, :, i] = up_chans[i]
+        return np.clip(final_rgb, 0, 1)
 
 # =================================================================
 # 5. AUTO-TUNER (PLACEHOLDER FOR CFA)
@@ -284,32 +341,46 @@ def main():
     if os.path.exists(SETTINGS_FILE):
         with open(SETTINGS_FILE, "r") as f: cfg.update(json.load(f))
         
-    valid_exts = ('.dng', '.arw', '.cr2', '.nef', '.orf')
+    valid_exts = ('.dng', '.arw', '.cr2', '.nef', '.orf', '.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp')
 
     if args.test:
         f = args.test
-        img = load_image(f)
+        img, is_cfa = load_image(f)
         if img is not None:
             for l_val in [1e-6, 1e-5, 1e-4]:
                 for t_val in [0.001, 0.002, 0.005]:
                     if not KEEP_RUNNING: break
-                    res = process_full(img, cfg, l_val, t_val)
-                    out = f"{os.path.splitext(f)[0]}_L{l_val}_T{t_val}.dng"
-                    MonolithDNGWriter().save(res, out)
+                    res = process_full(img, is_cfa, cfg, l_val, t_val)
+                    if is_cfa:
+                        out = f"{os.path.splitext(f)[0]}_L{l_val}_T{t_val}.dng"
+                        MonolithDNGWriter().save(res, out)
+                    else:
+                        out = f"{os.path.splitext(f)[0]}_L{l_val}_T{t_val}.tif"
+                        tifffile.imwrite(out, (res * 65535.0).astype(np.uint16))
 
     elif args.batch or args.input:
         path = args.batch if args.batch else args.input
         files = [os.path.join(path, f) for f in os.listdir(path) if f.lower().endswith(valid_exts)] if os.path.isdir(path) else [path]
         for f in files:
             if not KEEP_RUNNING: break
-            out_path = f"{os.path.splitext(f)[0]}_irk_v53.dng"
-            if os.path.exists(out_path): continue
             
-            start_time = time.time()
-            img = load_image(f)
+            img, is_cfa = load_image(f)
             if img is not None:
-                res = process_full(img, cfg)
-                MonolithDNGWriter().save(res, out_path)
+                if is_cfa:
+                    out_path = f"{os.path.splitext(f)[0]}_irk_v57.dng"
+                else:
+                    out_path = f"{os.path.splitext(f)[0]}_irk_v57.tif"
+                    
+                if os.path.exists(out_path): continue
+                
+                start_time = time.time()
+                res = process_full(img, is_cfa, cfg)
+                
+                if is_cfa:
+                    MonolithDNGWriter().save(res, out_path)
+                else:
+                    tifffile.imwrite(out_path, (res * 65535.0).astype(np.uint16))
+                    
                 logger.log_entry(os.path.basename(f), cfg["LAMBDA_MIN"], cfg["TV_WEIGHT"], time.time()-start_time)
                 print(f"[COMPLETE] Saved: {out_path}")
     else:
