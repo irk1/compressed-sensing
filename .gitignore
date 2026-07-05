@@ -604,3 +604,5 @@ CSNEW-Image_Gen/CSNEW-Image_Gen
 /build
 /build/CSNEW-Monolith_Xeon
 /build/CSNEW-Image_Gen
+deb
+build\CSNEW-Image_Gen
