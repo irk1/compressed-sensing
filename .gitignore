@@ -607,3 +607,7 @@ CSNEW-Image_Gen/CSNEW-Image_Gen
 deb
 build\CSNEW-Image_Gen
 *.spec
+CSNEW-Image_Gen.spec
+CSNEW-Monolith_Silent.spec
+CSNEW-Monolith_Xeon.spec
+ReconReportGen.nb
