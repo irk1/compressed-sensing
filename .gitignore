@@ -1,7 +1,6 @@
 OLD/dataset/original.npy
 OLD/dataset/sampled.npy
 build/CSNEW-Image_Gen/CSNEW-Image_Gen.pkg
-dist/CSNEW-Image_Gen
 Reconstruction_Report.pdf
 CSNEW-Image_Gen/_internal/matplotlib/mpl-data/images/back.pdf
 CSNEW-Image_Gen/_internal/matplotlib/mpl-data/images/hand.pdf
@@ -566,7 +565,6 @@ CSNEW-Image_Gen/_internal/wheel-0.37.1.egg-info/PKG-INFO
 CSNEW-Image_Gen/_internal/wheel-0.37.1.egg-info/requires.txt
 CSNEW-Image_Gen/_internal/wheel-0.37.1.egg-info/top_level.txt
 CSNEW-Image_Gen/_internal/yaml/_yaml.cpython-310-x86_64-linux-gnu.so
-CSNEW-Image_Gen/CSNEW-Image_Gen
 P2210206.JPG
 recon-downsample.png
 VERIFICATION_HEATMAP.png
@@ -593,7 +591,6 @@ build/CSNEW-Image_Gen/PYZ-00.toc
 build/CSNEW-Image_Gen/warn-CSNEW-Image_Gen.txt
 build/CSNEW-Image_Gen/xref-CSNEW-Image_Gen.html
 CSNEW-Image_Gen.spec
-dist/CSNEW-Image_Gen.exe
 build/CSNEW-Image_Gen/base_library.zip
 2025-11-08 19-36-49 (C,S1)6PB042129-1.psd
 training_log.csv
@@ -601,3 +598,5 @@ training_log.csv
 BeeOrchidTest_irk_v57.tif
 BeeOrchidTestFull.JPG
 *.dng
+CSNEW-Image_Gen/CSNEW-Image_Gen
+/build
