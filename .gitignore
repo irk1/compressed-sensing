@@ -606,3 +606,4 @@ CSNEW-Image_Gen/CSNEW-Image_Gen
 /build/CSNEW-Image_Gen
 deb
 build\CSNEW-Image_Gen
+*.spec
