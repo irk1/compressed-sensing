@@ -611,3 +611,4 @@ CSNEW-Image_Gen.spec
 CSNEW-Monolith_Silent.spec
 CSNEW-Monolith_Xeon.spec
 ReconReportGen.nb
+/build/CSNEW-Image_Gen
