@@ -61,7 +61,7 @@ class Silence:
         os.close(self.null_fd); os.close(self.save_fds[0]); os.close(self.save_fds[1])
 
 # =================================================================
-# 2. DNG WRITER ENGINE (v5.3.5 - HYBRID READY)
+# 2. DNG WRITER ENGINE (v5.7.1 - COMPLIANCE READY)
 # =================================================================
 class Tag:
     NewSubfileType = (254, 4); ImageWidth = (256, 4); ImageLength = (257, 4)
@@ -101,29 +101,39 @@ class dngTag:
             return heap_off + (len(self.packed_val) + 3) & ~3 
 
 class MonolithDNGWriter:
-    def save(self, data, path):
-        h, w = data.shape
+    def save(self, data, path, is_cfa=True):
+        if len(data.shape) == 2:
+            h, w = data.shape
+            samples, photo_interp = 1, 32803 # CFA
+        else:
+            h, w, samples = data.shape
+            photo_interp = 2 # RGB Linear DNG
+
         pixel_data = data.tobytes()
         meta = CAMERA_METADATA if CAMERA_METADATA else {"pattern": [0,1,1,2], "black": [0,0,0,0], "white": 65535}
         
         tags = [
             dngTag(Tag.NewSubfileType, [0]), dngTag(Tag.ImageWidth, [w]), dngTag(Tag.ImageLength, [h]),
-            dngTag(Tag.BitsPerSample, [16]), dngTag(Tag.Compression, [1]),
-            dngTag(Tag.PhotometricInterpretation, [32803]), 
-            dngTag(Tag.SamplesPerPixel, [1]),
-            dngTag(Tag.Software, "Irk_Monolith_v5.3.5_Hybrid"), 
-            dngTag(Tag.DNGVersion, [1, 4, 0, 0]), 
-            dngTag(Tag.DNGBackwardVersion, [1, 3, 0, 0]), 
+            dngTag(Tag.BitsPerSample, [16] * samples), dngTag(Tag.Compression, [1]),
+            dngTag(Tag.PhotometricInterpretation, [photo_interp]), 
+            dngTag(Tag.SamplesPerPixel, [samples]),
+            dngTag(Tag.Software, "Irk_Monolith_v5.7.1_Compliance"), 
+            dngTag(Tag.DNGVersion, [1, 7, 1, 0]), 
+            dngTag(Tag.DNGBackwardVersion, [1, 4, 0, 0]), 
             dngTag(Tag.Orientation, [1]), dngTag(Tag.UniqueCameraModel, "Xeon_Botanical_Custom"),
-            dngTag(Tag.CFARepeatPatternDim, [2, 2]),
-            dngTag(Tag.CFAPattern, meta["pattern"]),
-            dngTag(Tag.BlackLevelRepeatDim, [2, 2]),
-            dngTag(Tag.BlackLevel, meta["black"]), 
             dngTag(Tag.WhiteLevel, [meta["white"]]),
-            dngTag(Tag.AsShotNeutral, meta.get("as_shot_neutral", [(1, 1), (1, 1), (1, 1)])),
             dngTag(Tag.CalibrationIlluminant1, [21]),
             dngTag(Tag.ColorMatrix1, meta.get("color_matrix", [(1,1), (0,1), (0,1), (0,1), (1,1), (0,1), (0,1), (0,1), (1,1)]))
         ]
+        
+        if is_cfa or photo_interp == 32803:
+            tags.extend([
+                dngTag(Tag.CFARepeatPatternDim, [2, 2]),
+                dngTag(Tag.CFAPattern, meta["pattern"]),
+                dngTag(Tag.BlackLevelRepeatDim, [2, 2]),
+                dngTag(Tag.BlackLevel, meta["black"]), 
+                dngTag(Tag.AsShotNeutral, meta.get("as_shot_neutral", [(1, 1), (1, 1), (1, 1)]))
+            ])
         
         ifd_start = 16
         heap_start = (ifd_start + 2 + (len(tags) + 2) * 12 + 4 + 255) & ~255
@@ -316,11 +326,85 @@ def process_full(img_float, is_cfa, config, l_override=None, t_override=None):
         return np.clip(final_rgb, 0, 1)
 
 # =================================================================
-# 5. AUTO-TUNER (PLACEHOLDER FOR CFA)
+# 5. AUTO-TUNER
 # =================================================================
-def run_auto_tuner(folder_path, config, valid_exts, use_full_image=False):
-    print("[!] Auto-Tuner is currently optimized for RGB space. Using manual settings from JSON.")
-    return
+def run_auto_tuner(folder_path, config, valid_exts, use_full=False):
+    print("[*] Initializing No-Reference Auto-Tuner Pipeline...")
+    files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.lower().endswith(valid_exts)]
+    if not files:
+        print("[!] No valid images found for tuning.")
+        return config
+
+    # Dynamic Grid Construction
+    base_l = config.get("LAMBDA_MIN", 1e-4)
+    base_t = config.get("TV_WEIGHT", 0.005)
+    
+    l_grid = np.logspace(np.log10(base_l) - 1, np.log10(base_l) + 1, 3).tolist()
+    t_grid = np.linspace(base_t * 0.5, base_t * 1.5, 3).tolist()
+
+    scores = {(l, t): [] for l in l_grid for t in t_grid}
+
+    print(f"[*] Testing {len(l_grid) * len(t_grid)} parameter combinations on {len(files)} files...")
+    
+    for f in files:
+        if not KEEP_RUNNING: break
+        test_img, is_cfa = load_image(f)
+        if test_img is None: continue
+        
+        print(f"[*] Processing {os.path.basename(f)}...")
+
+        # Central Cropping Logic (512x512) or Full Bypass
+        if use_full:
+            crop = test_img
+            print("    -> Using full image for evaluation.")
+        else:
+            h, w = test_img.shape[:2]
+            cy, cx = h // 2, w // 2
+            
+            # Boundary checks to prevent indexing errors on smaller images
+            y1, y2 = max(0, cy - 256), min(h, cy + 256)
+            x1, x2 = max(0, cx - 256), min(w, cx + 256)
+            
+            if is_cfa:
+                crop = test_img[y1:y2, x1:x2]
+            else:
+                crop = test_img[y1:y2, x1:x2, :]
+            print(f"    -> Using central crop: {crop.shape}")
+
+        for l_val in l_grid:
+            for t_val in t_grid:
+                if not KEEP_RUNNING: break
+                res = process_full(crop, is_cfa, config, l_override=l_val, t_override=t_val)
+                
+                eval_img = res.astype(np.float32) / 65535.0 if is_cfa else cv2.cvtColor(res, cv2.COLOR_RGB2GRAY)
+                
+                laplacian_var = cv2.Laplacian(eval_img, cv2.CV_32F).var()
+                noise_residual = eval_img - cv2.medianBlur(eval_img, 3)
+                noise_var = noise_residual.var()
+                
+                q_score = laplacian_var / noise_var if noise_var > 0 else 0
+                scores[(l_val, t_val)].append(q_score)
+                print(f"        -> L:{l_val:.2e}, T:{t_val:.4f} | Q-Score: {q_score:.4f}")
+
+    # Directory Averaging & Parameter Selection
+    best_score = -1.0
+    best_params = {"LAMBDA_MIN": config["LAMBDA_MIN"], "TV_WEIGHT": config["TV_WEIGHT"]}
+
+    print("\n[*] --- Auto-Tuning Results (Directory Averages) ---")
+    for (l, t), score_list in scores.items():
+        avg_score = sum(score_list) / len(score_list) if score_list else 0
+        print(f"    -> L:{l:.2e}, T:{t:.4f} | Avg Q-Score: {avg_score:.4f}")
+        if avg_score > best_score:
+            best_score = avg_score
+            best_params["LAMBDA_MIN"] = l
+            best_params["TV_WEIGHT"] = t
+
+    config.update(best_params)
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump(config, f, indent=4)
+        
+    print(f"[*] Auto-Tuner Complete. Optimal Parameters saved to settings.json: {best_params}")
+    return config
 
 # =================================================================
 # 6. EXECUTION MODES
@@ -334,6 +418,8 @@ def main():
     parser.add_argument("input", nargs="?", help="Path to RAW file or folder")
     parser.add_argument("--test", help="Run 9-grid test mode on a file")
     parser.add_argument("--batch", help="Run resumable batch processing")
+    parser.add_argument("--tune", help="Run Auto-Tuner on a directory", action="store_true")
+    parser.add_argument("--full", action="store_true", help="Use full image for auto-tuning instead of 512x512 center crop")
     parser.add_argument("--dng", action="store_true", help="Output as DNG (True RAW)")
     args = parser.parse_args()
 
@@ -343,6 +429,10 @@ def main():
         
     valid_exts = ('.dng', '.arw', '.cr2', '.nef', '.orf', '.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp')
 
+    if args.tune and args.input:
+        cfg = run_auto_tuner(args.input, cfg, valid_exts, use_full=args.full)
+        sys.exit(0)
+
     if args.test:
         f = args.test
         img, is_cfa = load_image(f)
@@ -351,9 +441,9 @@ def main():
                 for t_val in [0.001, 0.002, 0.005]:
                     if not KEEP_RUNNING: break
                     res = process_full(img, is_cfa, cfg, l_val, t_val)
-                    if is_cfa:
+                    if is_cfa or args.dng:
                         out = f"{os.path.splitext(f)[0]}_L{l_val}_T{t_val}.dng"
-                        MonolithDNGWriter().save(res, out)
+                        MonolithDNGWriter().save(res, out, is_cfa)
                     else:
                         out = f"{os.path.splitext(f)[0]}_L{l_val}_T{t_val}.tif"
                         tifffile.imwrite(out, (res * 65535.0).astype(np.uint16))
@@ -366,18 +456,19 @@ def main():
             
             img, is_cfa = load_image(f)
             if img is not None:
-                if is_cfa:
-                    out_path = f"{os.path.splitext(f)[0]}_irk_v57.dng"
-                else:
-                    out_path = f"{os.path.splitext(f)[0]}_irk_v57.tif"
-                    
-                if os.path.exists(out_path): continue
+                force_dng = args.dng 
+                out_ext = ".dng" if (is_cfa or force_dng) else ".tif"
+                out_path = f"{os.path.splitext(f)[0]}_irk_v57{out_ext}"
+                
+                if os.path.exists(out_path): 
+                    print(f"[SKIP] {out_path} already exists. Resuming queue.")
+                    continue
                 
                 start_time = time.time()
                 res = process_full(img, is_cfa, cfg)
                 
-                if is_cfa:
-                    MonolithDNGWriter().save(res, out_path)
+                if out_ext == ".dng":
+                    MonolithDNGWriter().save(res, out_path, is_cfa=is_cfa)
                 else:
                     tifffile.imwrite(out_path, (res * 65535.0).astype(np.uint16))
                     

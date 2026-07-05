@@ -1,21 +1,27 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_all
 
-hiddenimports = ['rawpy', 'tifffile', 'psutil']
-hiddenimports += collect_submodules('cvxpy')
-hiddenimports += collect_submodules('scipy')
+datas = []
+binaries = []
+hiddenimports = ['rawpy', 'tifffile', 'psutil', 'cv2', 'ecos']
+tmp_ret = collect_all('osqp')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('qdldl')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('cvxpy')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
     ['CSNEW-Image_Gen.py'],
     pathex=[],
-    binaries=[],
-    datas=[],
+    binaries=binaries,
+    datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['torch', 'tensorflow', 'tensorboard'],
     noarchive=False,
     optimize=0,
 )

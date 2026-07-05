@@ -600,3 +600,7 @@ BeeOrchidTestFull.JPG
 *.dng
 CSNEW-Image_Gen/CSNEW-Image_Gen
 /build
+/dist
+/build
+/build/CSNEW-Monolith_Xeon
+/build/CSNEW-Image_Gen
