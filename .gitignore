@@ -600,7 +600,6 @@ BeeOrchidTestFull.JPG
 *.dng
 CSNEW-Image_Gen/CSNEW-Image_Gen
 /build
-/dist
 /build
 /build/CSNEW-Monolith_Xeon
 /build/CSNEW-Image_Gen
@@ -612,3 +611,7 @@ CSNEW-Monolith_Silent.spec
 CSNEW-Monolith_Xeon.spec
 ReconReportGen.nb
 /build/CSNEW-Image_Gen
+/build
+/build/CSNEW-Image_Gen
+/build
+/fresh_env
