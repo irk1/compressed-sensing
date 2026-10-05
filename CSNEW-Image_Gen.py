@@ -66,9 +66,9 @@ class Silence:
 class Tag:
     NewSubfileType = (254, 4); ImageWidth = (256, 4); ImageLength = (257, 4)
     BitsPerSample = (258, 3); Compression = (259, 3); PhotometricInterpretation = (262, 3)
-    SamplesPerPixel = (277, 3); Software = (305, 2); StripOffsets = (273, 4)
-    StripByteCounts = (279, 4); Orientation = (274, 3); DNGVersion = (50706, 1)
-    DNGBackwardVersion = (50707, 1); UniqueCameraModel = (50708, 2)
+    PlanarConfiguration = (284, 3); SamplesPerPixel = (277, 3); Software = (305, 2)
+    StripOffsets = (273, 4); StripByteCounts = (279, 4); Orientation = (274, 3)
+    DNGVersion = (50706, 1); DNGBackwardVersion = (50707, 1); UniqueCameraModel = (50708, 2)
     ColorMatrix1 = (50721, 10); AsShotNeutral = (50728, 5)
     CalibrationIlluminant1 = (50778, 3); BlackLevel = (50714, 4); WhiteLevel = (50717, 4)
     BlackLevelRepeatDim = (50713, 3); CFARepeatPatternDim = (33421, 3); CFAPattern = (33422, 1)
@@ -101,39 +101,62 @@ class dngTag:
             return heap_off + (len(self.packed_val) + 3) & ~3 
 
 class MonolithDNGWriter:
+    
     def save(self, data, path, is_cfa=True):
-        if len(data.shape) == 2:
-            h, w = data.shape
-            samples, photo_interp = 1, 32803 # CFA
-        else:
-            h, w, samples = data.shape
-            photo_interp = 2 # RGB Linear DNG
-
-        pixel_data = data.tobytes()
         meta = CAMERA_METADATA if CAMERA_METADATA else {"pattern": [0,1,1,2], "black": [0,0,0,0], "white": 65535}
         
+        # FAILSAFE 1: Strip 4th channel (Alpha/Padding) for Linear DNGs to strictly match 3x3 Color Matrix
+        if len(data.shape) == 3 and data.shape[2] > 3:
+            data = data[:, :, :3]
+
+        # FAILSAFE 2: Convert 32-bit floats to 16-bit unsigned integers
+        if data.dtype != np.uint16:
+            data = (np.clip(data, 0, 1) * meta["white"]).astype(np.uint16)
+
+        if len(data.shape) == 2:
+            h, w = data.shape
+            samples, photo_interp = 1, 32803 # True RAW (CFA)
+        else:
+            h, w, samples = data.shape
+            photo_interp = 34892 # Linear RAW (RGB Demosaiced)
+
+        
+        pixel_data = data.tobytes()
+        
+        # Handle BlackLevel channels
+        black_level = meta["black"]
+        if samples == 3:
+            black_level = [black_level[0]] * 3 if len(black_level) > 0 else [0, 0, 0]
+
         tags = [
             dngTag(Tag.NewSubfileType, [0]), dngTag(Tag.ImageWidth, [w]), dngTag(Tag.ImageLength, [h]),
             dngTag(Tag.BitsPerSample, [16] * samples), dngTag(Tag.Compression, [1]),
             dngTag(Tag.PhotometricInterpretation, [photo_interp]), 
             dngTag(Tag.SamplesPerPixel, [samples]),
-            dngTag(Tag.Software, "Irk_Monolith_v5.7.1_Compliance"), 
-            dngTag(Tag.DNGVersion, [1, 7, 1, 0]), 
+            dngTag(Tag.Software, "Irk_Monolith_v5.7.2"), 
+            dngTag(Tag.DNGVersion, [1, 4, 0, 0]), 
             dngTag(Tag.DNGBackwardVersion, [1, 4, 0, 0]), 
             dngTag(Tag.Orientation, [1]), dngTag(Tag.UniqueCameraModel, "Xeon_Botanical_Custom"),
             dngTag(Tag.WhiteLevel, [meta["white"]]),
             dngTag(Tag.CalibrationIlluminant1, [21]),
-            dngTag(Tag.ColorMatrix1, meta.get("color_matrix", [(1,1), (0,1), (0,1), (0,1), (1,1), (0,1), (0,1), (0,1), (1,1)]))
+            dngTag(Tag.ColorMatrix1, meta.get("color_matrix", [(1,1), (0,1), (0,1), (0,1), (1,1), (0,1), (0,1), (0,1), (1,1)])),
+            dngTag(Tag.BlackLevel, black_level),
+            dngTag(Tag.AsShotNeutral, meta.get("as_shot_neutral", [(1, 1), (1, 1), (1, 1)]))
         ]
         
+        # Require Chunky Planar Configuration for RGB data
+        if samples > 1:
+            tags.append(dngTag(Tag.PlanarConfiguration, [1]))
+        
+        # ONLY apply Bayer Pattern tags if it is actually a Bayer image
         if is_cfa or photo_interp == 32803:
             tags.extend([
                 dngTag(Tag.CFARepeatPatternDim, [2, 2]),
                 dngTag(Tag.CFAPattern, meta["pattern"]),
-                dngTag(Tag.BlackLevelRepeatDim, [2, 2]),
-                dngTag(Tag.BlackLevel, meta["black"]), 
-                dngTag(Tag.AsShotNeutral, meta.get("as_shot_neutral", [(1, 1), (1, 1), (1, 1)]))
+                dngTag(Tag.BlackLevelRepeatDim, [2, 2])
             ])
+            
+        tags.sort(key=lambda x: x.TagId)
         
         ifd_start = 16
         heap_start = (ifd_start + 2 + (len(tags) + 2) * 12 + 4 + 255) & ~255
@@ -192,11 +215,89 @@ def load_image(path):
             print(f"[ERROR] Standard Image Loading Failed: {e}")
             return None, False
 
-    # 2. True RAW / CFA Pipeline
+    # 2. RAW / CFA & Linear DNG Pipeline
     try:
+        # --- NEW: Extract Original Color Metadata Using tifffile ---
+        # Bypass rawpy to prevent it from stripping ColorMatrix tags in Linear DNGs
+        c_mat, as_shot_neutral = None, None
+        try:
+            def to_rat(v):
+                if hasattr(v, 'numerator'): return (int(v.numerator), int(v.denominator))
+                if isinstance(v, tuple) and len(v) == 2: return (int(v[0]), int(v[1]))
+                return (int(float(v) * 10000), 10000)
+
+            with tifffile.TiffFile(path) as tif:
+                tags = tif.pages[0].tags
+                # Try ColorMatrix2 first (D65 matrix), then fallback to ColorMatrix1
+                if 'ColorMatrix2' in tags:
+                    val = tags['ColorMatrix2'].value
+                    if len(val) == 9: c_mat = [to_rat(v) for v in val]
+                if c_mat is None and 'ColorMatrix1' in tags:
+                    val = tags['ColorMatrix1'].value
+                    if len(val) == 9: c_mat = [to_rat(v) for v in val]
+                    
+                if 'AsShotNeutral' in tags:
+                    val = tags['AsShotNeutral'].value
+                    if len(val) == 3: as_shot_neutral = [to_rat(v) for v in val]
+        except Exception as e:
+            pass # Fall back to rawpy extraction if tifffile fails
+
         with rawpy.imread(path) as raw:
             bayer = raw.raw_image_visible.astype(np.float32)
-            white_level = float(max(raw.camera_white_level_per_channel))
+            
+            # Fallbacks if tifffile couldn't find the metadata
+            if as_shot_neutral is None:
+                wb = raw.camera_whitebalance
+                nr = int(10000 / wb[0]) if (wb is not None and len(wb) > 0 and wb[0] > 0) else 10000
+                ng = int(10000 / wb[1]) if (wb is not None and len(wb) > 1 and wb[1] > 0) else 10000
+                nb = int(10000 / wb[2]) if (wb is not None and len(wb) > 2 and wb[2] > 0) else 10000
+                as_shot_neutral = [(nr, 10000), (ng, 10000), (nb, 10000)]
+
+            if c_mat is None:
+                try:
+                    xyz_cam = raw.rgb_xyz_matrix[:3, :3]
+                    if np.sum(np.abs(xyz_cam)) < 0.1: 
+                        # Safe fallback (sRGB to XYZ) to prevent Identity matrix color shifts
+                        xyz_cam = np.array([[ 3.2404542, -1.5371385, -0.4985314],
+                                            [-0.9692660,  1.8760108,  0.0415560],
+                                            [ 0.0556434, -0.2040259,  1.0572252]])
+                    c_mat = [(int(val * 10000), 10000) for val in xyz_cam.flatten()]
+                except:
+                    c_mat = [(10000, 10000), (0, 10000), (0, 10000), 
+                             (0, 10000), (10000, 10000), (0, 10000), 
+                             (0, 10000), (0, 10000), (10000, 10000)]
+
+            # --> DETECT LINEAR DNGs (like Topaz outputs)
+            if len(bayer.shape) == 3:
+                print(f"[*] Detected Linear DNG. Routing to RGB pipeline...")
+                try:
+                    wl_data = raw.camera_white_level_per_channel
+                    white_level = float(max(wl_data) if isinstance(wl_data, (list, tuple)) else wl_data)
+                except:
+                    white_level = float(np.max(bayer) or 65535.0)
+
+                try:
+                    black_levels = [int(x) for x in raw.black_level_per_channel]
+                except:
+                    black_levels = [0, 0, 0]
+
+                CAMERA_METADATA = {
+                    "pattern": [0,1,1,2],
+                    "black": black_levels,
+                    "white": int(white_level),
+                    "as_shot_neutral": as_shot_neutral,
+                    "color_matrix": c_mat
+                }
+
+                img = bayer / white_level
+                return img, False # False = Not CFA, process as standard RGB
+
+            # --> Standard CFA (Bayer) DNG
+            try:
+                white_level = float(max(raw.camera_white_level_per_channel))
+            except:
+                white_level = float(np.max(bayer))
+                
             bayer = bayer / white_level
             
             h, w = bayer.shape
@@ -209,31 +310,19 @@ def load_image(path):
             pattern_raw = raw.raw_pattern.flatten().tolist()
             pattern_dng = [1 if x == 3 else x for x in pattern_raw]
             
-            wb = raw.camera_whitebalance
-            nr = int(10000 / wb[0]) if wb[0] > 0 else 10000
-            ng = int(10000 / wb[1]) if wb[1] > 0 else 10000
-            nb = int(10000 / wb[2]) if wb[2] > 0 else 10000
-
-            try:
-                xyz_cam = raw.rgb_xyz_matrix[:3, :3]
-                if np.sum(np.abs(xyz_cam)) < 0.1: xyz_cam = np.eye(3)
-            except:
-                xyz_cam = np.eye(3)
-                
-            c_mat = [(int(val * 10000), 10000) for val in xyz_cam.flatten()]
-            
             CAMERA_METADATA = {
                 "pattern": pattern_dng,
                 "black": [int(x) for x in raw.black_level_per_channel],
                 "white": int(white_level),
-                "as_shot_neutral": [(nr, 10000), (ng, 10000), (nb, 10000)],
+                "as_shot_neutral": as_shot_neutral,
                 "color_matrix": c_mat
             }
             return cfa_packed, True # True = Is CFA/RAW
+
     except Exception as e:
         print(f"[ERROR] RAW Loading Failed: {e}")
         return None, False
-
+        
 def get_dct_matrix(n):
     d = np.zeros((n, n))
     freq = np.pi * (np.arange(n) + 0.5) / n
@@ -323,7 +412,9 @@ def process_full(img_float, is_cfa, config, l_override=None, t_override=None):
         final_rgb = np.zeros((out_h, out_w, chans), dtype=np.float32)
         for i in range(chans):
             final_rgb[:, :, i] = up_chans[i]
-        return np.clip(final_rgb, 0, 1)
+            
+        white_level = CAMERA_METADATA.get("white", 65535)
+        return (np.clip(final_rgb, 0, 1) * white_level).astype(np.uint16)
 
 # =================================================================
 # 5. AUTO-TUNER
@@ -470,7 +561,10 @@ def main():
                 if out_ext == ".dng":
                     MonolithDNGWriter().save(res, out_path, is_cfa=is_cfa)
                 else:
-                    tifffile.imwrite(out_path, (res * 65535.0).astype(np.uint16))
+                    # Safe fallback in case data wasn't converted
+                    if res.dtype == np.float32:
+                        res = (np.clip(res, 0, 1) * 65535.0).astype(np.uint16)
+                    tifffile.imwrite(out_path, res)
                     
                 logger.log_entry(os.path.basename(f), cfg["LAMBDA_MIN"], cfg["TV_WEIGHT"], time.time()-start_time)
                 print(f"[COMPLETE] Saved: {out_path}")
