@@ -619,3 +619,6 @@ ReconReportGen.nb
 /build
 dist/CSNEW-Image_Gen
 dist/CSNEW-Image_Gen.exe
+BigTiff.py
+/build
+/build/CSNEW-Image_Gen
