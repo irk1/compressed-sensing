@@ -14,7 +14,11 @@ import numpy as np
 import cv2
 import cvxpy as cp
 import tifffile
+import zlib
 from multiprocessing import sharedctypes
+from skimage.metrics import structural_similarity as ssim
+from scipy.spatial.distance import correlation
+
 
 # =================================================================
 # 1. HARDWARE, SIGNALS & LOGGING
@@ -36,13 +40,22 @@ class LiveLogger:
         self.filename = filename
         if not os.path.exists(self.filename):
             with open(self.filename, 'w', encoding="utf-8") as f:
-                f.write("Timestamp_UTC,File_Name,Lambda,TV_Weight,Duration_Sec,Status\n")
+                f.write("Date_UTC,Time_UTC,File_Name,Scale_Factor,Lambda,TV_Weight,Duration_Sec,MSE,PSNR,SSIM,Correlation,Composite_Loss\n")
                 f.flush()
                 os.fsync(f.fileno())
 
-    def log_entry(self, file_name, l_val, t_val, duration, status="SUCCESS"):
-        utc_now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-        line = f"{utc_now},{file_name},{l_val},{t_val},{duration:.2f},{status}\n"
+    def log_entry(self, file_name, scale, l_val, t_val, duration, mse=None, psnr=None, ssim=None, corr=None, comp_loss=None):
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        date_utc = now_utc.strftime('%Y-%m-%d')
+        time_utc = now_utc.strftime('%H:%M:%S')        
+        scale_str = str(scale) if scale is not None else "N/A"
+        m_str = f"{mse:.6f}" if mse is not None else "N/A"
+        p_str = f"{psnr:.4f}" if psnr is not None else "N/A"
+        s_str = f"{ssim:.6f}" if ssim is not None else "N/A"
+        c_str = f"{corr:.6f}" if corr is not None else "N/A"
+        l_str = f"{comp_loss:.6f}" if comp_loss is not None else "N/A"
+        
+        line = f"{date_utc},{time_utc},{file_name},{scale_str},{l_val},{t_val},{duration:.2f},{m_str},{p_str},{s_str},{c_str},{l_str}\n"
         with open(self.filename, 'a', encoding="utf-8") as f:
             f.write(line)
             f.flush()
@@ -81,12 +94,29 @@ class dngTag:
         self.is_inline = len(self.packed_val) <= 4
 
     def _pack_raw(self, val):
-        if self.DataType == 1: return struct.pack(f"<{len(val)}B", *val)
-        if self.DataType == 2: return val.encode('ascii') + b'\x00'
-        if self.DataType == 3: return struct.pack(f"<{len(val)}H", *val)
-        if self.DataType == 4: return struct.pack(f"<{len(val)}L", *val)
-        if self.DataType == 5: return struct.pack(f"<{len(val)*2}L", *[i for sub in val for i in sub])
-        if self.DataType == 10: return struct.pack(f"<{len(val)*2}l", *[i for sub in val for i in sub])
+        # Apply bitwise masks to bypass Python's strict sign checking.
+        # This guarantees the exact binary bytes are written regardless of positive/negative.
+        if self.DataType == 1: 
+            return struct.pack(f"<{len(val)}B", *[v & 0xFF for v in val])
+        
+        if self.DataType == 2: 
+            return val.encode('ascii') + b'\x00'
+            
+        if self.DataType == 3: 
+            return struct.pack(f"<{len(val)}H", *[v & 0xFFFF for v in val])
+            
+        if self.DataType == 4: 
+            return struct.pack(f"<{len(val)}I", *[v & 0xFFFFFFFF for v in val])
+            
+        if self.DataType == 5: 
+            flat_val = [i for sub in val for i in sub]
+            return struct.pack(f"<{len(flat_val)}I", *[v & 0xFFFFFFFF for v in flat_val])
+            
+        if self.DataType == 10: 
+            flat_val = [i for sub in val for i in sub]
+            # 10 is strictly SRATIONAL (Signed), so we can safely use 'i' here
+            return struct.pack(f"<{len(flat_val)}i", *flat_val)
+            
         return b''
 
     def write(self, buf, tag_off, heap_off):
@@ -98,8 +128,7 @@ class dngTag:
         else:
             struct.pack_into("<HHII", buf, tag_off, self.TagId, self.DataType, self.DataCount, heap_off)
             buf[heap_off:heap_off+len(self.packed_val)] = self.packed_val
-            return heap_off + (len(self.packed_val) + 3) & ~3 
-
+            return heap_off + (len(self.packed_val) + 3) & ~3
 class MonolithDNGWriter:
     
     def save(self, data, path, is_cfa=True):
@@ -120,8 +149,11 @@ class MonolithDNGWriter:
             h, w, samples = data.shape
             photo_interp = 34892 # Linear RAW (RGB Demosaiced)
 
-        
-        pixel_data = data.tobytes()
+        # --- COMPRESSION IMPLEMENTATION ---
+        raw_bytes = data.tobytes()
+        print(f"[*] Compressing {len(raw_bytes)/(1024**3):.2f} GB of DNG data to bypass 32-bit limits...")
+        # zlib level 6 provides a great balance of speed vs file size reduction
+        compressed_data = zlib.compress(raw_bytes, level=6) 
         
         # Handle BlackLevel channels
         black_level = meta["black"]
@@ -130,7 +162,8 @@ class MonolithDNGWriter:
 
         tags = [
             dngTag(Tag.NewSubfileType, [0]), dngTag(Tag.ImageWidth, [w]), dngTag(Tag.ImageLength, [h]),
-            dngTag(Tag.BitsPerSample, [16] * samples), dngTag(Tag.Compression, [1]),
+            dngTag(Tag.BitsPerSample, [16] * samples), 
+            dngTag(Tag.Compression, [8]), # CHANGED: 8 = Deflate Compression
             dngTag(Tag.PhotometricInterpretation, [photo_interp]), 
             dngTag(Tag.SamplesPerPixel, [samples]),
             dngTag(Tag.Software, "Irk_Monolith_v5.7.2"), 
@@ -166,7 +199,8 @@ class MonolithDNGWriter:
         
         pixel_off = (temp_heap + 1024) & ~255
         tags.append(dngTag(Tag.StripOffsets, [pixel_off]))
-        tags.append(dngTag(Tag.StripByteCounts, [len(pixel_data)]))
+        # CHANGED: Register the much smaller compressed byte count
+        tags.append(dngTag(Tag.StripByteCounts, [len(compressed_data)]))
         tags.sort(key=lambda x: x.TagId)
 
         header = bytearray(pixel_off)
@@ -180,7 +214,8 @@ class MonolithDNGWriter:
             
         with open(path, "wb") as f:
             f.write(header)
-            f.write(pixel_data)
+            # CHANGED: Write the compressed data block
+            f.write(compressed_data)
 
 # =================================================================
 # 3. MATH KERNEL & LOADING
@@ -217,35 +252,35 @@ def load_image(path):
 
     # 2. RAW / CFA & Linear DNG Pipeline
     try:
-        # --- NEW: Extract Original Color Metadata Using tifffile ---
-        # Bypass rawpy to prevent it from stripping ColorMatrix tags in Linear DNGs
         c_mat, as_shot_neutral = None, None
         try:
-            def to_rat(v):
-                if hasattr(v, 'numerator'): return (int(v.numerator), int(v.denominator))
-                if isinstance(v, tuple) and len(v) == 2: return (int(v[0]), int(v[1]))
-                return (int(float(v) * 10000), 10000)
+            # Extracts exact values with original signs (no masks, no absolute values)
+            def extract_exact_rational(v):
+                if hasattr(v, 'numerator'): 
+                    return (int(v.numerator), int(v.denominator))
+                elif isinstance(v, tuple) and len(v) == 2: 
+                    return (int(v[0]), int(v[1]))
+                else: 
+                    return (int(float(v) * 10000), 10000)
 
             with tifffile.TiffFile(path) as tif:
                 tags = tif.pages[0].tags
-                # Try ColorMatrix2 first (D65 matrix), then fallback to ColorMatrix1
                 if 'ColorMatrix2' in tags:
                     val = tags['ColorMatrix2'].value
-                    if len(val) == 9: c_mat = [to_rat(v) for v in val]
+                    if len(val) == 9: c_mat = [extract_exact_rational(v) for v in val]
                 if c_mat is None and 'ColorMatrix1' in tags:
                     val = tags['ColorMatrix1'].value
-                    if len(val) == 9: c_mat = [to_rat(v) for v in val]
+                    if len(val) == 9: c_mat = [extract_exact_rational(v) for v in val]
                     
                 if 'AsShotNeutral' in tags:
                     val = tags['AsShotNeutral'].value
-                    if len(val) == 3: as_shot_neutral = [to_rat(v) for v in val]
-        except Exception as e:
-            pass # Fall back to rawpy extraction if tifffile fails
+                    if len(val) == 3: as_shot_neutral = [extract_exact_rational(v) for v in val]
+        except Exception:
+            pass 
 
         with rawpy.imread(path) as raw:
             bayer = raw.raw_image_visible.astype(np.float32)
             
-            # Fallbacks if tifffile couldn't find the metadata
             if as_shot_neutral is None:
                 wb = raw.camera_whitebalance
                 nr = int(10000 / wb[0]) if (wb is not None and len(wb) > 0 and wb[0] > 0) else 10000
@@ -257,17 +292,17 @@ def load_image(path):
                 try:
                     xyz_cam = raw.rgb_xyz_matrix[:3, :3]
                     if np.sum(np.abs(xyz_cam)) < 0.1: 
-                        # Safe fallback (sRGB to XYZ) to prevent Identity matrix color shifts
                         xyz_cam = np.array([[ 3.2404542, -1.5371385, -0.4985314],
                                             [-0.9692660,  1.8760108,  0.0415560],
                                             [ 0.0556434, -0.2040259,  1.0572252]])
+                    # Allowing the natural negative values from the default matrix
                     c_mat = [(int(val * 10000), 10000) for val in xyz_cam.flatten()]
                 except:
                     c_mat = [(10000, 10000), (0, 10000), (0, 10000), 
                              (0, 10000), (10000, 10000), (0, 10000), 
                              (0, 10000), (0, 10000), (10000, 10000)]
 
-            # --> DETECT LINEAR DNGs (like Topaz outputs)
+            # --> DETECT LINEAR DNGs
             if len(bayer.shape) == 3:
                 print(f"[*] Detected Linear DNG. Routing to RGB pipeline...")
                 try:
@@ -281,16 +316,17 @@ def load_image(path):
                 except:
                     black_levels = [0, 0, 0]
 
+                global CAMERA_METADATA
                 CAMERA_METADATA = {
                     "pattern": [0,1,1,2],
                     "black": black_levels,
-                    "white": int(white_level),
+                    "white": max(1, int(white_level)),
                     "as_shot_neutral": as_shot_neutral,
                     "color_matrix": c_mat
                 }
 
                 img = bayer / white_level
-                return img, False # False = Not CFA, process as standard RGB
+                return img, False 
 
             # --> Standard CFA (Bayer) DNG
             try:
@@ -310,19 +346,24 @@ def load_image(path):
             pattern_raw = raw.raw_pattern.flatten().tolist()
             pattern_dng = [1 if x == 3 else x for x in pattern_raw]
             
+            try:
+                black_levels = [int(x) for x in raw.black_level_per_channel]
+            except:
+                black_levels = [0, 0, 0]
+                
             CAMERA_METADATA = {
                 "pattern": pattern_dng,
-                "black": [int(x) for x in raw.black_level_per_channel],
-                "white": int(white_level),
+                "black": black_levels,
+                "white": max(1, int(white_level)),
                 "as_shot_neutral": as_shot_neutral,
                 "color_matrix": c_mat
             }
-            return cfa_packed, True # True = Is CFA/RAW
+            return cfa_packed, True 
 
     except Exception as e:
         print(f"[ERROR] RAW Loading Failed: {e}")
-        return None, False
-        
+        return None, False  
+              
 def get_dct_matrix(n):
     d = np.zeros((n, n))
     freq = np.pi * (np.arange(n) + 0.5) / n
@@ -419,74 +460,148 @@ def process_full(img_float, is_cfa, config, l_override=None, t_override=None):
 # =================================================================
 # 5. AUTO-TUNER
 # =================================================================
-def run_auto_tuner(folder_path, config, valid_exts, use_full=False):
-    print("[*] Initializing No-Reference Auto-Tuner Pipeline...")
+def chunked_composite_loss(ref_img, recon_img, chunk_size=4096):
+    h, w = ref_img.shape[:2]
+    
+    # 1. Normalize ref_img to [0.0, 1.0] float32
+    if ref_img.dtype == np.uint8:
+        ref_img = ref_img.astype(np.float32) / 255.0
+    elif ref_img.dtype == np.uint16:
+        ref_img = ref_img.astype(np.float32) / 65535.0
+    elif ref_img.dtype in [np.float32, np.float64]:
+        max_ref = float(np.max(ref_img))
+        if max_ref > 1.0:
+            ref_img = ref_img / max_ref
+
+    # 2. Normalize recon_img to [0.0, 1.0] float32 independently
+    if recon_img.dtype == np.uint8:
+        recon_img = recon_img.astype(np.float32) / 255.0
+    elif recon_img.dtype == np.uint16:
+        recon_img = recon_img.astype(np.float32) / 65535.0
+    elif recon_img.dtype in [np.float32, np.float64]:
+        max_recon = float(np.max(recon_img))
+        if max_recon > 1.0:
+            recon_img = recon_img / max_recon
+
+    total_mse, total_psnr, total_ssim, total_corr = 0, 0, 0, 0
+    chunks = 0
+    
+    for y in range(0, h, chunk_size):
+        for x in range(0, w, chunk_size):
+            ref_chunk = ref_img[y:y+chunk_size, x:x+chunk_size]
+            recon_chunk = recon_img[y:y+chunk_size, x:x+chunk_size]
+            
+            if ref_chunk.shape[0] < 7 or ref_chunk.shape[1] < 7:
+                continue
+                
+            mse = np.mean((ref_chunk - recon_chunk) ** 2)
+            psnr = 10 * np.log10(1.0 / mse) if mse > 1e-10 else 100.0
+            corr = correlation(ref_chunk.flatten(), recon_chunk.flatten())
+            
+            is_multi = len(ref_chunk.shape) == 3
+            s_val = ssim(ref_chunk, recon_chunk, channel_axis=2 if is_multi else None, data_range=1.0)
+            
+            total_mse += mse
+            total_psnr += psnr
+            total_corr += corr
+            total_ssim += s_val
+            chunks += 1
+            
+    if chunks == 0:
+        return float('inf'), float('inf'), 0.0, 0.0, 0.0
+        
+    avg_mse = total_mse / chunks
+    avg_psnr = total_psnr / chunks
+    avg_corr = total_corr / chunks
+    avg_ssim = total_ssim / chunks
+    
+    norm_mse = min(avg_mse * 10, 1.0)
+    norm_psnr = max(0.0, (50.0 - avg_psnr) / 50.0) 
+    norm_ssim = 1.0 - avg_ssim
+    
+    composite_loss = (0.4 * norm_ssim) + (0.3 * norm_psnr) + (0.2 * (1.0 - avg_corr)) + (0.1 * norm_mse)
+    
+    return composite_loss, avg_mse, avg_psnr, avg_ssim, avg_corr
+
+def run_auto_tuner(folder_path, config, valid_exts, use_full=True):
+    print(f"[*] Initializing Full-Reference Auto-Tuner...")
+    print(f"[*] Hardware limits enforced: {config.get('MAX_THREADS', 'All')} Cores, {config.get('MAX_RAM_GB', 30)} GB RAM")
+    
     files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.lower().endswith(valid_exts)]
     if not files:
         print("[!] No valid images found for tuning.")
         return config
 
-    # Dynamic Grid Construction
     base_l = config.get("LAMBDA_MIN", 1e-4)
     base_t = config.get("TV_WEIGHT", 0.005)
+    scale = config.get("SCALE_FACTOR", 2)
     
+    # 3x3 Grid Construction
     l_grid = np.logspace(np.log10(base_l) - 1, np.log10(base_l) + 1, 3).tolist()
     t_grid = np.linspace(base_t * 0.5, base_t * 1.5, 3).tolist()
-
     scores = {(l, t): [] for l in l_grid for t in t_grid}
 
     print(f"[*] Testing {len(l_grid) * len(t_grid)} parameter combinations on {len(files)} files...")
     
     for f in files:
         if not KEEP_RUNNING: break
-        test_img, is_cfa = load_image(f)
-        if test_img is None: continue
         
-        print(f"[*] Processing {os.path.basename(f)}...")
+        gt_img, is_cfa = load_image(f)
+        if gt_img is None: continue
+        
+        print(f"\n[*] Tuning on {os.path.basename(f)}...")
+        h, w = gt_img.shape[:2]
 
-        # Central Cropping Logic (512x512) or Full Bypass
-        if use_full:
-            crop = test_img
-            print("    -> Using full image for evaluation.")
-        else:
-            h, w = test_img.shape[:2]
-            cy, cx = h // 2, w // 2
-            
-            # Boundary checks to prevent indexing errors on smaller images
-            y1, y2 = max(0, cy - 256), min(h, cy + 256)
-            x1, x2 = max(0, cx - 256), min(w, cx + 256)
-            
-            if is_cfa:
-                crop = test_img[y1:y2, x1:x2]
-            else:
-                crop = test_img[y1:y2, x1:x2, :]
-            print(f"    -> Using central crop: {crop.shape}")
-
+        # 1. Simulate Sensor Data (Degrade the image using Area Interpolation to prevent moiré)
+        new_w, new_h = w // scale, h // scale
+        simulated_sensor_data = cv2.resize(gt_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        
+        # Lock the ground truth dimensions so they perfectly match the reconstruction output
+        gt_img_cropped = gt_img[:new_h * scale, :new_w * scale]
+        
         for l_val in l_grid:
             for t_val in t_grid:
                 if not KEEP_RUNNING: break
-                res = process_full(crop, is_cfa, config, l_override=l_val, t_override=t_val)
+
+                step_start_time = time.time()
+
+                # 2. Reconstruct (Hardware limits are enforced internally by process_full)
+                recon_img = process_full(simulated_sensor_data, is_cfa, config, l_override=l_val, t_override=t_val)
                 
-                eval_img = res.astype(np.float32) / 65535.0 if is_cfa else cv2.cvtColor(res, cv2.COLOR_RGB2GRAY)
-                
-                laplacian_var = cv2.Laplacian(eval_img, cv2.CV_32F).var()
-                noise_residual = eval_img - cv2.medianBlur(eval_img, 3)
-                noise_var = noise_residual.var()
-                
-                q_score = laplacian_var / noise_var if noise_var > 0 else 0
-                scores[(l_val, t_val)].append(q_score)
-                print(f"        -> L:{l_val:.2e}, T:{t_val:.4f} | Q-Score: {q_score:.4f}")
+                # 3. Memory-Safe Chunked Evaluation
+                # FIX: Unpack the new return values
+                loss, mse_val, psnr_val, ssim_val, corr_val = chunked_composite_loss(gt_img_cropped, recon_img, chunk_size=4096)
+                scores[(l_val, t_val)].append(loss)
+
+                step_duration = time.time() - step_start_time
+                # Log to the CSV immediately so it can be monitored mid-tune
+                logger.log_entry(
+                    file_name=os.path.basename(f), 
+                    scale=scale,
+                    l_val=l_val, 
+                    t_val=t_val, 
+                    duration=step_duration, 
+                    mse=mse_val,       
+                    psnr=psnr_val,
+                    ssim=ssim_val,
+                    corr=corr_val,
+                    comp_loss=loss
+                )
+                print(f"    -> L:{l_val:.2e}, T:{t_val:.4f} | Composite Loss: {loss:.4f} (Lower is better)")
 
     # Directory Averaging & Parameter Selection
-    best_score = -1.0
+    best_loss = float('inf')
     best_params = {"LAMBDA_MIN": config["LAMBDA_MIN"], "TV_WEIGHT": config["TV_WEIGHT"]}
 
     print("\n[*] --- Auto-Tuning Results (Directory Averages) ---")
     for (l, t), score_list in scores.items():
-        avg_score = sum(score_list) / len(score_list) if score_list else 0
-        print(f"    -> L:{l:.2e}, T:{t:.4f} | Avg Q-Score: {avg_score:.4f}")
-        if avg_score > best_score:
-            best_score = avg_score
+        if not score_list: continue
+        
+        avg_loss = sum(score_list) / len(score_list)
+        print(f"    -> L:{l:.2e}, T:{t:.4f} | Avg Loss: {avg_loss:.4f}")
+        
+        if avg_loss < best_loss:
+            best_loss = avg_loss
             best_params["LAMBDA_MIN"] = l
             best_params["TV_WEIGHT"] = t
 
@@ -512,6 +627,7 @@ def main():
     parser.add_argument("--tune", help="Run Auto-Tuner on a directory", action="store_true")
     parser.add_argument("--full", action="store_true", help="Use full image for auto-tuning instead of 512x512 center crop")
     parser.add_argument("--dng", action="store_true", help="Output as DNG (True RAW)")
+    
     args = parser.parse_args()
 
     cfg = {"SCALE_FACTOR": 2, "TILE_SIZE": 64, "OVERLAP": 16, "LAMBDA_MIN": 1e-4, "TV_WEIGHT": 0.005, "MAX_THREADS": 48, "MAX_RAM_GB": 30}
@@ -537,7 +653,16 @@ def main():
                         MonolithDNGWriter().save(res, out, is_cfa)
                     else:
                         out = f"{os.path.splitext(f)[0]}_L{l_val}_T{t_val}.tif"
-                        tifffile.imwrite(out, (res * 65535.0).astype(np.uint16))
+                        # Ensure 3-channel RGB for safe TIFF writing
+                        if len(res.shape) == 3 and res.shape[2] > 3:
+                            res = res[:, :, :3]
+                        tifffile.imwrite(
+                            out, 
+                            (res * 65535.0).astype(np.uint16),
+                            bigtiff=True, 
+                            compression='zlib', 
+                            photometric='rgb'
+                        )
 
     elif args.batch or args.input:
         path = args.batch if args.batch else args.input
@@ -564,9 +689,20 @@ def main():
                     # Safe fallback in case data wasn't converted
                     if res.dtype == np.float32:
                         res = (np.clip(res, 0, 1) * 65535.0).astype(np.uint16)
-                    tifffile.imwrite(out_path, res)
                     
-                logger.log_entry(os.path.basename(f), cfg["LAMBDA_MIN"], cfg["TV_WEIGHT"], time.time()-start_time)
+                    # Ensure 3-channel RGB to prevent alpha bugs
+                    if len(res.shape) == 3 and res.shape[2] > 3:
+                        res = res[:, :, :3]
+                        
+                    tifffile.imwrite(
+                        out_path, 
+                        res,
+                        bigtiff=True, 
+                        compression='zlib', 
+                        photometric='rgb'
+                    )
+                    
+                logger.log_entry(os.path.basename(f), cfg["SCALE_FACTOR"], cfg["LAMBDA_MIN"], cfg["TV_WEIGHT"], time.time()-start_time)
                 print(f"[COMPLETE] Saved: {out_path}")
     else:
         parser.print_help()

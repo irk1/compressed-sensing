@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = []
-hiddenimports = ['rawpy', 'tifffile', 'psutil', 'cv2', 'ecos']
+hiddenimports = ['rawpy', 'tifffile', 'psutil', 'cv2', 'ecos','appdirs', 'skimage.metrics', 'scipy.spatial', 'scipy.spatial.distance', 'scipy.spatial.transform']
 tmp_ret = collect_all('osqp')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('qdldl')

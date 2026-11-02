@@ -622,3 +622,11 @@ dist/CSNEW-Image_Gen.exe
 BigTiff.py
 /build
 /build/CSNEW-Image_Gen
+build/CSNEW-Image_Gen/Analysis-00.toc
+build/CSNEW-Image_Gen/base_library.zip
+build/CSNEW-Image_Gen/EXE-00.toc
+build/CSNEW-Image_Gen/PKG-00.toc
+build/CSNEW-Image_Gen/PYZ-00.pyz
+build/CSNEW-Image_Gen/PYZ-00.toc
+build/CSNEW-Image_Gen/warn-CSNEW-Image_Gen.txt
+build/CSNEW-Image_Gen/xref-CSNEW-Image_Gen.html
