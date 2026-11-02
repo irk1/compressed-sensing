@@ -1,6 +1,6 @@
-### CSNEW-Image_Gen: High-Precision Compressed Sensing Upscaler (v5.7)
+### IRK_CS-Upscale: High-Precision Compressed Sensing Upscaler (v5.7)
 
-CSNEW-Image_Gen is a professional-grade image reconstruction engine designed for high-bit-depth digital negatives. Unlike standard AI upscalers that generate pixels via neural networks, this tool uses Compressed Sensing and Basis Pursuit Denoising to reconstruct signals using mathematical optimization.
+IRK_CS-Upscale is a professional-grade image reconstruction engine designed for high-bit-depth digital negatives. Unlike standard AI upscalers that generate pixels via neural networks, this tool uses Compressed Sensing and Basis Pursuit Denoising to reconstruct signals using mathematical optimization.
 
 The system is optimized for Dual-Xeon Workstations, leveraging high core counts, shared memory blocks, and massive RAM pools to solve complex convex optimization problems at 16-bit precision.
 
@@ -30,7 +30,7 @@ To avoid the precision loss inherent in 8-bit or 16-bit integer processing, the 
 
 ### Architecture & Portability
 
-CSNEW-Image_Gen is designed for high-efficiency workstation deployment.
+IRK_CS-Upscale is designed for high-efficiency workstation deployment.
 
 * **MonolithDNGWriter (Native DNG 1.7.1.0):** Completely removes the reliance on external ExifTool dependencies. The engine natively packs and structures 16-bit binary pixel data directly into compliant DNG containers. In v5.7, this is used specifically for RAW/CFA inputs to preserve the full sensor signal chain.
 * **Hybrid Signal Chain:** The engine dynamically detects input types. RAW files are processed as 4-channel Bayer grids (CFA), while standard images are processed as 3-channel RGB arrays.
@@ -58,16 +58,16 @@ The engine utilizes `rawpy` for RAW sensor data and `cv2`/`tifffile` for raster 
 
 The engine is distributed as a command-line utility.
 
-`./CSNEW-Image_Gen [file]`
+`./IRK_CS-Upscale [file]`
 Process a single image using `settings.json` parameters. The engine automatically selects the `.dng` (RAW) or `.tif` (RGB) output format based on the input type.
 
-`./CSNEW-Image_Gen --batch [directory]`
+`./IRK_CS-Upscale --batch [directory]`
 Production mode: Processes all images in a directory. Skips already-upscaled files to allow safe resuming of interrupted jobs. Automatically routes files to their respective CFA or RGB processing paths.
 
-`./CSNEW-Image_Gen --test [file/dir]`
+`./IRK_CS-Upscale --test [file/dir]`
 Visual Training Mode: Generates a 9-way parameter sweep grid to manually find the optimal parameters. RAW inputs output 9 `.dng` files. RGB inputs output 9 `.tif` files. Outputs are saved as labeled files (e.g., `_L1e-05_T0.002.dng` or `.tif`) for direct evaluation.
 
-`./CSNEW-Image_Gen --tune [directory] [--full]`
+`./IRK_CS-Upscale --tune [directory] [--full]`
 Auto-Tuning Engine: Reads a folder of sample images and automatically calculates the mathematical optimum for Lambda and TV weights, writing the winner directly to your `settings.json`. By default, it operates on a fast 512x512 central crop. Append `--full` to bypass the heuristic and tune against the entire image.
 
 `--dng`

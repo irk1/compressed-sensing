@@ -627,7 +627,8 @@ def main():
     parser.add_argument("--tune", help="Run Auto-Tuner on a directory", action="store_true")
     parser.add_argument("--full", action="store_true", help="Use full image for auto-tuning instead of 512x512 center crop")
     parser.add_argument("--dng", action="store_true", help="Output as DNG (True RAW)")
-    
+    parser.add_argument("--enhance", action="store_true", help="Apply BM3D denoising and Richardson-Lucy sharpening")
+
     args = parser.parse_args()
 
     cfg = {"SCALE_FACTOR": 2, "TILE_SIZE": 64, "OVERLAP": 16, "LAMBDA_MIN": 1e-4, "TV_WEIGHT": 0.005, "MAX_THREADS": 48, "MAX_RAM_GB": 30}
@@ -635,7 +636,13 @@ def main():
         with open(SETTINGS_FILE, "r") as f: cfg.update(json.load(f))
         
     valid_exts = ('.dng', '.arw', '.cr2', '.nef', '.orf', '.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp')
-
+    if args.enhance:
+        from CS-Enhance.py import apply_bm3d, apply_richardson_lucy
+        
+        # Ensure recon_img is a normalized [0.0, 1.0] float32 array
+        recon_img = apply_bm3d(recon_img, noise_std_dev=0.04)
+        recon_img = apply_richardson_lucy(recon_img, iterations=15)
+        
     if args.tune and args.input:
         cfg = run_auto_tuner(args.input, cfg, valid_exts, use_full=args.full)
         sys.exit(0)
