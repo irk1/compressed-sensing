@@ -18,6 +18,7 @@ import zlib
 from multiprocessing import sharedctypes
 from skimage.metrics import structural_similarity as ssim
 from scipy.spatial.distance import correlation
+import skimage.io
 
 
 # =================================================================
@@ -74,7 +75,7 @@ class Silence:
         os.close(self.null_fd); os.close(self.save_fds[0]); os.close(self.save_fds[1])
 
 # =================================================================
-# 2. DNG WRITER ENGINE (v5.7.1 - COMPLIANCE READY)
+# 2. DNG WRITER ENGINE (v5.8.0 - COMPLIANCE READY)
 # =================================================================
 class Tag:
     NewSubfileType = (254, 4); ImageWidth = (256, 4); ImageLength = (257, 4)
@@ -166,10 +167,10 @@ class MonolithDNGWriter:
             dngTag(Tag.Compression, [8]), # CHANGED: 8 = Deflate Compression
             dngTag(Tag.PhotometricInterpretation, [photo_interp]), 
             dngTag(Tag.SamplesPerPixel, [samples]),
-            dngTag(Tag.Software, "Irk_Monolith_v5.7.2"), 
+            dngTag(Tag.Software, "IRK-CS-Upscale_v5.8.0"), 
             dngTag(Tag.DNGVersion, [1, 4, 0, 0]), 
             dngTag(Tag.DNGBackwardVersion, [1, 4, 0, 0]), 
-            dngTag(Tag.Orientation, [1]), dngTag(Tag.UniqueCameraModel, "Xeon_Botanical_Custom"),
+            dngTag(Tag.Orientation, [1]), dngTag(Tag.UniqueCameraModel, "Xenon Safrole"),
             dngTag(Tag.WhiteLevel, [meta["white"]]),
             dngTag(Tag.CalibrationIlluminant1, [21]),
             dngTag(Tag.ColorMatrix1, meta.get("color_matrix", [(1,1), (0,1), (0,1), (0,1), (1,1), (0,1), (0,1), (0,1), (1,1)])),
@@ -234,18 +235,22 @@ def load_image(path):
                 if img is not None and len(img.shape) == 3:
                     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             
-            if img is None: return None, False
+            if img is None:
+                return None, False
             
             if len(img.shape) == 2:
                 img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
             elif len(img.shape) == 3 and img.shape[2] == 4:
                 img = img[:, :, :3]
                 
-            if img.dtype == np.uint8: img = img.astype(np.float32) / 255.0
-            elif img.dtype == np.uint16: img = img.astype(np.float32) / 65535.0
-            else: img = img.astype(np.float32)
+            if img.dtype == np.uint8:
+                img = img.astype(np.float32) / 255.0
+            elif img.dtype == np.uint16:
+                img = img.astype(np.float32) / 65535.0
+            else:
+                img = img.astype(np.float32)
             
-            return img, False # False = Not CFA/RAW
+            return img, False  # False = Not CFA/RAW
         except Exception as e:
             print(f"[ERROR] Standard Image Loading Failed: {e}")
             return None, False
@@ -253,72 +258,80 @@ def load_image(path):
     # 2. RAW / CFA & Linear DNG Pipeline
     try:
         c_mat, as_shot_neutral = None, None
-        try:
-            # Extracts exact values with original signs (no masks, no absolute values)
-            def extract_exact_rational(v):
-                if hasattr(v, 'numerator'): 
-                    return (int(v.numerator), int(v.denominator))
-                elif isinstance(v, tuple) and len(v) == 2: 
-                    return (int(v[0]), int(v[1]))
-                else: 
-                    return (int(float(v) * 10000), 10000)
 
-            with tifffile.TiffFile(path) as tif:
-                tags = tif.pages[0].tags
-                if 'ColorMatrix2' in tags:
-                    val = tags['ColorMatrix2'].value
-                    if len(val) == 9: c_mat = [extract_exact_rational(v) for v in val]
-                if c_mat is None and 'ColorMatrix1' in tags:
-                    val = tags['ColorMatrix1'].value
-                    if len(val) == 9: c_mat = [extract_exact_rational(v) for v in val]
-                    
-                if 'AsShotNeutral' in tags:
-                    val = tags['AsShotNeutral'].value
-                    if len(val) == 3: as_shot_neutral = [extract_exact_rational(v) for v in val]
-        except Exception:
-            pass 
+        # Only parse TIFF/DNG tags on actual .dng files (avoids tifffile warnings on .ORF/.CR2/.NEF/etc.)
+        if ext == '.dng':
+            try:
+                def extract_exact_rational(v):
+                    if hasattr(v, 'numerator'): 
+                        return (int(v.numerator), int(v.denominator))
+                    elif isinstance(v, tuple) and len(v) == 2: 
+                        return (int(v[0]), int(v[1]))
+                    else: 
+                        return (int(round(float(v) * 10000)), 10000)
+
+                with tifffile.TiffFile(path) as tif:
+                    tags = tif.pages[0].tags
+                    if 'ColorMatrix2' in tags:
+                        val = tags['ColorMatrix2'].value
+                        if len(val) == 9:
+                            c_mat = [extract_exact_rational(v) for v in val]
+                    if c_mat is None and 'ColorMatrix1' in tags:
+                        val = tags['ColorMatrix1'].value
+                        if len(val) == 9:
+                            c_mat = [extract_exact_rational(v) for v in val]
+                        
+                    if 'AsShotNeutral' in tags:
+                        val = tags['AsShotNeutral'].value
+                        if len(val) == 3:
+                            as_shot_neutral = [extract_exact_rational(v) for v in val]
+            except Exception:
+                pass 
 
         with rawpy.imread(path) as raw:
             bayer = raw.raw_image_visible.astype(np.float32)
             
             if as_shot_neutral is None:
                 wb = raw.camera_whitebalance
-                nr = int(10000 / wb[0]) if (wb is not None and len(wb) > 0 and wb[0] > 0) else 10000
-                ng = int(10000 / wb[1]) if (wb is not None and len(wb) > 1 and wb[1] > 0) else 10000
-                nb = int(10000 / wb[2]) if (wb is not None and len(wb) > 2 and wb[2] > 0) else 10000
+                if wb is not None and len(wb) >= 3 and wb[0] > 0 and wb[1] > 0 and wb[2] > 0:
+                    g_ref = float(wb[1])
+                    nr = int(round((g_ref / float(wb[0])) * 10000))
+                    ng = 10000
+                    nb = int(round((g_ref / float(wb[2])) * 10000))
+                else:
+                    nr, ng, nb = 10000, 10000, 10000
                 as_shot_neutral = [(nr, 10000), (ng, 10000), (nb, 10000)]
 
             if c_mat is None:
                 try:
+                    # LibRaw's rgb_xyz_matrix (cam_xyz) is already XYZ -> Camera (identical to DNG ColorMatrix2)
                     xyz_cam = raw.rgb_xyz_matrix[:3, :3]
-                    if np.sum(np.abs(xyz_cam)) < 0.1: 
+                    if np.sum(np.abs(xyz_cam)) < 0.1:
                         xyz_cam = np.array([[ 3.2404542, -1.5371385, -0.4985314],
                                             [-0.9692660,  1.8760108,  0.0415560],
                                             [ 0.0556434, -0.2040259,  1.0572252]])
-                    # Allowing the natural negative values from the default matrix
-                    c_mat = [(int(val * 10000), 10000) for val in xyz_cam.flatten()]
-                except:
+                    c_mat = [(int(round(val * 10000)), 10000) for val in xyz_cam.flatten()]
+                except Exception:
                     c_mat = [(10000, 10000), (0, 10000), (0, 10000), 
                              (0, 10000), (10000, 10000), (0, 10000), 
                              (0, 10000), (0, 10000), (10000, 10000)]
 
             # --> DETECT LINEAR DNGs
             if len(bayer.shape) == 3:
-                print(f"[*] Detected Linear DNG. Routing to RGB pipeline...")
+                print("[*] Detected Linear DNG. Routing to RGB pipeline...")
                 try:
                     wl_data = raw.camera_white_level_per_channel
                     white_level = float(max(wl_data) if isinstance(wl_data, (list, tuple)) else wl_data)
-                except:
+                except Exception:
                     white_level = float(np.max(bayer) or 65535.0)
 
                 try:
                     black_levels = [int(x) for x in raw.black_level_per_channel]
-                except:
+                except Exception:
                     black_levels = [0, 0, 0]
 
-                global CAMERA_METADATA
                 CAMERA_METADATA = {
-                    "pattern": [0,1,1,2],
+                    "pattern": [0, 1, 1, 2],
                     "black": black_levels,
                     "white": max(1, int(white_level)),
                     "as_shot_neutral": as_shot_neutral,
@@ -328,16 +341,16 @@ def load_image(path):
                 img = bayer / white_level
                 return img, False 
 
-            # --> Standard CFA (Bayer) DNG
+            # --> Standard CFA (Bayer) RAW / DNG
             try:
                 white_level = float(max(raw.camera_white_level_per_channel))
-            except:
+            except Exception:
                 white_level = float(np.max(bayer))
                 
             bayer = bayer / white_level
             
             h, w = bayer.shape
-            cfa_packed = np.zeros((h//2, w//2, 4), dtype=np.float32)
+            cfa_packed = np.zeros((h // 2, w // 2, 4), dtype=np.float32)
             cfa_packed[:, :, 0] = bayer[0::2, 0::2]
             cfa_packed[:, :, 1] = bayer[0::2, 1::2]
             cfa_packed[:, :, 2] = bayer[1::2, 0::2]
@@ -347,9 +360,10 @@ def load_image(path):
             pattern_dng = [1 if x == 3 else x for x in pattern_raw]
             
             try:
-                black_levels = [int(x) for x in raw.black_level_per_channel]
-            except:
-                black_levels = [0, 0, 0]
+                bl_per_ch = raw.black_level_per_channel
+                black_levels = [int(bl_per_ch[i]) for i in pattern_raw]
+            except Exception:
+                black_levels = [0, 0, 0, 0]
                 
             CAMERA_METADATA = {
                 "pattern": pattern_dng,
@@ -362,8 +376,8 @@ def load_image(path):
 
     except Exception as e:
         print(f"[ERROR] RAW Loading Failed: {e}")
-        return None, False  
-              
+        return None, False
+                      
 def get_dct_matrix(n):
     d = np.zeros((n, n))
     freq = np.pi * (np.arange(n) + 0.5) / n
@@ -615,6 +629,7 @@ def run_auto_tuner(folder_path, config, valid_exts, use_full=True):
 # =================================================================
 # 6. EXECUTION MODES
 # =================================================================
+
 def main():
     multiprocessing.freeze_support()
     try: multiprocessing.set_start_method('spawn', force=True)
@@ -627,7 +642,8 @@ def main():
     parser.add_argument("--tune", help="Run Auto-Tuner on a directory", action="store_true")
     parser.add_argument("--full", action="store_true", help="Use full image for auto-tuning instead of 512x512 center crop")
     parser.add_argument("--dng", action="store_true", help="Output as DNG (True RAW)")
-    parser.add_argument("--enhance", action="store_true", help="Apply BM3D denoising and Richardson-Lucy sharpening")
+    parser.add_argument("--enhance", action="store_true", help="Apply BM3D denoising and Richardson-Lucy sharpening after upscaling")
+    parser.add_argument("--enhance-only", action="store_true", help="Run only BM3D and Richardson-Lucy, skipping the upscale")
 
     args = parser.parse_args()
 
@@ -636,17 +652,53 @@ def main():
         with open(SETTINGS_FILE, "r") as f: cfg.update(json.load(f))
         
     valid_exts = ('.dng', '.arw', '.cr2', '.nef', '.orf', '.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp')
-    if args.enhance:
-        from CS-Enhance.py import apply_bm3d, apply_richardson_lucy
+
+    # --- INTERCEPT: ENHANCE ONLY ---
+    if getattr(args, 'enhance_only', False):
+        print("[*] Running enhancement only. Upscaling will be skipped.")
+        # Make sure your file is named 'image_enhancers.py'
+        from image_enhancers import apply_bm3d, apply_richardson_lucy
         
-        # Ensure recon_img is a normalized [0.0, 1.0] float32 array
-        recon_img = apply_bm3d(recon_img, noise_std_dev=0.04)
-        recon_img = apply_richardson_lucy(recon_img, iterations=15)
+        input_path = getattr(args, 'input', None)
+        if not input_path:
+            raise ValueError("Input path is required for --enhance-only.")
         
+        input_img = skimage.io.imread(input_path)
+        
+        # Normalize
+        if input_img.dtype == np.uint16:
+            float_img = input_img.astype(np.float32) / 65535.0
+        elif input_img.dtype == np.uint8:
+            float_img = input_img.astype(np.float32) / 255.0
+        else:
+            float_img = input_img.astype(np.float32)
+            if float_img.max() > 1.0:
+                float_img /= float_img.max()
+            
+        print("Applying BM3D denoising...")
+        clean_img = apply_bm3d(float_img, noise_std_dev=0.04)
+        print("Applying Richardson-Lucy sharpening...")
+        sharp_img = apply_richardson_lucy(clean_img, iterations=15)
+        
+        # Scale back
+        if input_img.dtype == np.uint16:
+            final_output = (sharp_img * 65535.0).astype(np.uint16)
+        else:
+            final_output = (sharp_img * 255.0).astype(np.uint8)
+            
+        out_ext = os.path.splitext(input_path)[1]
+        output_path = f"{os.path.splitext(input_path)[0]}_enhanced{out_ext}"
+        
+        skimage.io.imsave(output_path, final_output)
+        print(f"[*] Enhancement complete. Saved to {output_path}. Exiting.")
+        sys.exit(0)
+
+    # --- AUTO TUNER ---
     if args.tune and args.input:
         cfg = run_auto_tuner(args.input, cfg, valid_exts, use_full=args.full)
         sys.exit(0)
 
+    # --- TEST MODE ---
     if args.test:
         f = args.test
         img, is_cfa = load_image(f)
@@ -655,22 +707,32 @@ def main():
                 for t_val in [0.001, 0.002, 0.005]:
                     if not KEEP_RUNNING: break
                     res = process_full(img, is_cfa, cfg, l_val, t_val)
+                    
+                    # Apply enhancement if flagged
+                    if args.enhance:
+                        from image_enhancers import apply_bm3d, apply_richardson_lucy
+                        print(f"[*] Enhancing test output L{l_val}_T{t_val}...")
+                        res_float = res.astype(np.float32) / 65535.0
+                        res_float = apply_bm3d(res_float, noise_std_dev=0.04)
+                        res_float = apply_richardson_lucy(res_float, iterations=15)
+                        res = (res_float * 65535.0).astype(np.uint16)
+
                     if is_cfa or args.dng:
                         out = f"{os.path.splitext(f)[0]}_L{l_val}_T{t_val}.dng"
                         MonolithDNGWriter().save(res, out, is_cfa)
                     else:
                         out = f"{os.path.splitext(f)[0]}_L{l_val}_T{t_val}.tif"
-                        # Ensure 3-channel RGB for safe TIFF writing
                         if len(res.shape) == 3 and res.shape[2] > 3:
                             res = res[:, :, :3]
                         tifffile.imwrite(
                             out, 
-                            (res * 65535.0).astype(np.uint16),
+                            res,
                             bigtiff=True, 
                             compression='zlib', 
                             photometric='rgb'
                         )
 
+    # --- BATCH / SINGLE FILE MODE ---
     elif args.batch or args.input:
         path = args.batch if args.batch else args.input
         files = [os.path.join(path, f) for f in os.listdir(path) if f.lower().endswith(valid_exts)] if os.path.isdir(path) else [path]
@@ -681,26 +743,29 @@ def main():
             if img is not None:
                 force_dng = args.dng 
                 out_ext = ".dng" if (is_cfa or force_dng) else ".tif"
-                out_path = f"{os.path.splitext(f)[0]}_irk_v57{out_ext}"
+                out_path = f"{os.path.splitext(f)[0]}_irk_v58{out_ext}"
                 
                 if os.path.exists(out_path): 
                     print(f"[SKIP] {out_path} already exists. Resuming queue.")
                     continue
                 
-                start_time = time.time()
+                print(f"[*] Processing {f}...")
                 res = process_full(img, is_cfa, cfg)
                 
-                if out_ext == ".dng":
-                    MonolithDNGWriter().save(res, out_path, is_cfa=is_cfa)
+                # Apply enhancement to the upscaled result
+                if args.enhance:
+                    from image_enhancers import apply_bm3d, apply_richardson_lucy
+                    print("[*] Applying BM3D and Richardson-Lucy enhancements to upscaled image...")
+                    res_float = res.astype(np.float32) / 65535.0
+                    res_float = apply_bm3d(res_float, noise_std_dev=0.04)
+                    res_float = apply_richardson_lucy(res_float, iterations=15)
+                    res = (res_float * 65535.0).astype(np.uint16)
+
+                if is_cfa or force_dng:
+                    MonolithDNGWriter().save(res, out_path, is_cfa)
                 else:
-                    # Safe fallback in case data wasn't converted
-                    if res.dtype == np.float32:
-                        res = (np.clip(res, 0, 1) * 65535.0).astype(np.uint16)
-                    
-                    # Ensure 3-channel RGB to prevent alpha bugs
                     if len(res.shape) == 3 and res.shape[2] > 3:
                         res = res[:, :, :3]
-                        
                     tifffile.imwrite(
                         out_path, 
                         res,
@@ -708,11 +773,8 @@ def main():
                         compression='zlib', 
                         photometric='rgb'
                     )
-                    
-                logger.log_entry(os.path.basename(f), cfg["SCALE_FACTOR"], cfg["LAMBDA_MIN"], cfg["TV_WEIGHT"], time.time()-start_time)
-                print(f"[COMPLETE] Saved: {out_path}")
-    else:
-        parser.print_help()
+                print(f"[*] Saved {out_path}")
+
 
 if __name__ == "__main__":
     main()
