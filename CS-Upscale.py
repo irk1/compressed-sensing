@@ -18,8 +18,7 @@ import zlib
 from multiprocessing import sharedctypes
 from skimage.metrics import structural_similarity as ssim
 from scipy.spatial.distance import correlation
-import skimage.io
-
+import CS_Enhance
 
 # =================================================================
 # 1. HARDWARE, SIGNALS & LOGGING
@@ -217,19 +216,36 @@ class MonolithDNGWriter:
             f.write(header)
             # CHANGED: Write the compressed data block
             f.write(compressed_data)
+    
+def save_tiff(path, data):
+    if data.ndim == 3 and data.shape[2] > 3:
+        data = data[:, :, :3]
+    data = np.ascontiguousarray(data)
+    use_bigtiff = data.nbytes >= 3_800_000_000
+    tifffile.imwrite(
+        path,
+        data,
+        bigtiff=use_bigtiff,
+        compression='adobe_deflate',
+        photometric='rgb',
+        planarconfig='contig',
+    )
 
 # =================================================================
 # 3. MATH KERNEL & LOADING
 # =================================================================
 def load_image(path):
+
     global CAMERA_METADATA
     ext = os.path.splitext(path)[1].lower()
-    
+
     # 1. Standard RGB Image Pipeline
     if ext in ['.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp']:
         try:
             if ext in ['.tif', '.tiff']:
-                img = tifffile.imread(path)
+                img = tifffile.imread(path, key=0)
+                if img.ndim == 3 and img.shape[0] in (3, 4) and img.shape[2] > 4:
+                    img = np.transpose(img, (1, 2, 0))
             else:
                 img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
                 if img is not None and len(img.shape) == 3:
@@ -249,12 +265,15 @@ def load_image(path):
                 img = img.astype(np.float32) / 65535.0
             else:
                 img = img.astype(np.float32)
+                max_val = float(np.nanmax(img)) if img.size else 1.0
+                if max_val > 1.0:
+                    img = img / (65535.0 if max_val > 255.0 else 255.0)
             
-            return img, False  # False = Not CFA/RAW
+            return np.clip(img, 0.0, 1.0), False  # False = Not CFA/RAW
         except Exception as e:
             print(f"[ERROR] Standard Image Loading Failed: {e}")
             return None, False
-
+        
     # 2. RAW / CFA & Linear DNG Pipeline
     try:
         c_mat, as_shot_neutral = None, None
@@ -372,12 +391,12 @@ def load_image(path):
                 "as_shot_neutral": as_shot_neutral,
                 "color_matrix": c_mat
             }
-            return cfa_packed, True 
+            return cfa_packed, True
 
     except Exception as e:
         print(f"[ERROR] RAW Loading Failed: {e}")
         return None, False
-                      
+
 def get_dct_matrix(n):
     d = np.zeros((n, n))
     freq = np.pi * (np.arange(n) + 0.5) / n
@@ -385,11 +404,20 @@ def get_dct_matrix(n):
         d[k, :] = np.sqrt(1/n) if k == 0 else np.sqrt(2/n) * np.cos(k * freq)
     return d
 
+def get_tile_coords(dim, ts, stride):
+    if dim <= ts:
+        return [0]
+    coords = list(range(0, dim - ts + 1, stride))
+    if coords[-1] != dim - ts:
+        coords.append(dim - ts)
+    return coords
+
 def solve_tile_shared(args):
     y_idx, x_idx, ts, scale, l_min, tv_w, t_id, shm_shape = args
     shared_arr = np.frombuffer(shared_mem_base, dtype=np.float32).reshape(shm_shape)
     lr_tile = shared_arr[y_idx:y_idx+ts, x_idx:x_idx+ts]
-    hh, ww = ts * scale, ts * scale
+    th, tw = lr_tile.shape
+    hh, ww = th * scale, tw * scale
     D_h, D_w = get_dct_matrix(hh), get_dct_matrix(ww)
     X_dct = cp.Variable((hh, ww))
     img_rec = D_h.T @ X_dct @ D_w
@@ -405,6 +433,7 @@ def solve_tile_shared(args):
 # =================================================================
 # 4. ORCHESTRATION & GENERATORS
 # =================================================================
+
 def init_worker(shm):
     global shared_mem_base
     shared_mem_base = shm
@@ -412,8 +441,8 @@ def init_worker(shm):
 def work_generator(H, W, ts, stride, scale, l_min, tv_w, chan_shape, config):
     max_ram_bytes = config.get("MAX_RAM_GB", 30) * (1024**3)
     tile_count = 0
-    for y in range(0, H - ts + 1, stride):
-        for x in range(0, W - ts + 1, stride):
+    for y in get_tile_coords(H, ts, stride):
+        for x in get_tile_coords(W, ts, stride):
             while psutil.virtual_memory().available < (psutil.virtual_memory().total - max_ram_bytes):
                 time.sleep(0.5)
             if not KEEP_RUNNING: return
@@ -440,37 +469,35 @@ def process_full(img_float, is_cfa, config, l_override=None, t_override=None):
         
         pos = {}
         tile_cnt = 0
-        for y in range(0, H - ts + 1, stride):
-            for x in range(0, W - ts + 1, stride):
-                pos[tile_cnt] = (y*scale, x*scale)
+        for y in get_tile_coords(H, ts, stride):
+            for x in get_tile_coords(W, ts, stride):
+                pos[tile_cnt] = (y * scale, x * scale)
                 tile_cnt += 1
 
         work_gen = work_generator(H, W, ts, stride, scale, l_min, tv_w, chan_data.shape, config)
         with multiprocessing.Pool(processes=cpus, initializer=init_worker, initargs=(shm,)) as pool:
             for t_id, result in pool.imap_unordered(solve_tile_shared, work_gen, chunksize=4):
                 y_up, x_up = pos[t_id]
-                out[y_up:y_up+(ts*scale), x_up:x_up+(ts*scale)] = result
+                out[y_up:y_up+result.shape[0], x_up:x_up+result.shape[1]] = result
         up_chans.append(out); gc.collect()
-
     if is_cfa:
-        out_h, out_w = H * scale * 2, W * scale * 2
-        final_bayer = np.zeros((out_h, out_w), dtype=np.float32)
-        final_bayer[0::2, 0::2] = up_chans[0]
-        final_bayer[0::2, 1::2] = up_chans[1]
-        final_bayer[1::2, 0::2] = up_chans[2]
-        final_bayer[1::2, 1::2] = up_chans[3]
-        
-        white_level = CAMERA_METADATA.get("white", 65535)
-        return (np.clip(final_bayer, 0, 1) * white_level).astype(np.uint16)
+            out_h, out_w = H * scale * 2, W * scale * 2
+            final_bayer = np.zeros((out_h, out_w), dtype=np.float32)
+            final_bayer[0::2, 0::2] = up_chans[0]
+            final_bayer[0::2, 1::2] = up_chans[1]
+            final_bayer[1::2, 0::2] = up_chans[2]
+            final_bayer[1::2, 1::2] = up_chans[3]
+
+            white_level = CAMERA_METADATA.get("white", 65535)
+            return (np.clip(final_bayer, 0, 1) * white_level).astype(np.uint16)
     else:
         out_h, out_w = H * scale, W * scale
         final_rgb = np.zeros((out_h, out_w, chans), dtype=np.float32)
         for i in range(chans):
             final_rgb[:, :, i] = up_chans[i]
-            
+
         white_level = CAMERA_METADATA.get("white", 65535)
         return (np.clip(final_rgb, 0, 1) * white_level).astype(np.uint16)
-
 # =================================================================
 # 5. AUTO-TUNER
 # =================================================================
@@ -632,8 +659,10 @@ def run_auto_tuner(folder_path, config, valid_exts, use_full=True):
 
 def main():
     multiprocessing.freeze_support()
-    try: multiprocessing.set_start_method('spawn', force=True)
-    except RuntimeError: pass
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
 
     parser = argparse.ArgumentParser()
     parser.add_argument("input", nargs="?", help="Path to RAW file or folder")
@@ -642,54 +671,74 @@ def main():
     parser.add_argument("--tune", help="Run Auto-Tuner on a directory", action="store_true")
     parser.add_argument("--full", action="store_true", help="Use full image for auto-tuning instead of 512x512 center crop")
     parser.add_argument("--dng", action="store_true", help="Output as DNG (True RAW)")
-    parser.add_argument("--enhance", action="store_true", help="Apply BM3D denoising and Richardson-Lucy sharpening after upscaling")
+    parser.add_argument("--enhance", action="store_true", help="Run pre-CS sensor denoising before upscaling")
     parser.add_argument("--enhance-only", action="store_true", help="Run only BM3D and Richardson-Lucy, skipping the upscale")
 
     args = parser.parse_args()
 
-    cfg = {"SCALE_FACTOR": 2, "TILE_SIZE": 64, "OVERLAP": 16, "LAMBDA_MIN": 1e-4, "TV_WEIGHT": 0.005, "MAX_THREADS": 48, "MAX_RAM_GB": 30}
+    cfg = {
+        "SCALE_FACTOR": 2,
+        "TILE_SIZE": 64,
+        "OVERLAP": 16,
+        "LAMBDA_MIN": 1e-4,
+        "TV_WEIGHT": 0.005,
+        "MAX_THREADS": 48,
+        "MAX_RAM_GB": 30,
+    }
     if os.path.exists(SETTINGS_FILE):
-        with open(SETTINGS_FILE, "r") as f: cfg.update(json.load(f))
-        
+        with open(SETTINGS_FILE, "r") as f:
+            cfg.update(json.load(f))
+
     valid_exts = ('.dng', '.arw', '.cr2', '.nef', '.orf', '.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp')
 
-    # --- INTERCEPT: ENHANCE ONLY ---
-    if getattr(args, 'enhance_only', False):
+    # --- INTERCEPT: ENHANCE ONLY (Supports both RAW/CFA and standard raster files) ---
+    if args.enhance_only:
         print("[*] Running enhancement only. Upscaling will be skipped.")
-        # Make sure your file is named 'image_enhancers.py'
-        from image_enhancers import apply_bm3d, apply_richardson_lucy
-        
-        input_path = getattr(args, 'input', None)
-        if not input_path:
+
+        if not args.input:
             raise ValueError("Input path is required for --enhance-only.")
-        
-        input_img = skimage.io.imread(input_path)
-        
-        # Normalize
-        if input_img.dtype == np.uint16:
-            float_img = input_img.astype(np.float32) / 65535.0
-        elif input_img.dtype == np.uint8:
-            float_img = input_img.astype(np.float32) / 255.0
+
+        float_img, is_cfa = load_image(args.input)
+        if float_img is None:
+            sys.exit(1)
+
+        sigma = cfg.get("DENOISE_SIGMA", None)
+        rl_iters = int(cfg.get("SHARPEN_ITERS", 15))
+        psf_sigma = float(cfg.get("PSF_SIGMA", 0.75 if is_cfa else 1.2))
+        white_lvl = float(CAMERA_METADATA.get("white", 65535.0)) if CAMERA_METADATA else 65535.0
+
+        print(f"[*] Applying BM3D denoising ({'4-ch CFA' if is_cfa else '3-ch RGB'})...")
+        clean_img = CS_Enhance.apply_bm3d(
+            float_img,
+            noise_std_dev=sigma,
+            use_anscombe=cfg.get("USE_ANSCOMBE", is_cfa),
+            sensor_gain=white_lvl,
+        )
+
+        print(f"[*] Applying Richardson-Lucy deconvolution ({rl_iters} iters)...")
+        sharp_img = CS_Enhance.apply_richardson_lucy(clean_img, iterations=rl_iters, psf_sigma=psf_sigma)
+
+        if is_cfa:
+            # Unpack (H/2, W/2, 4) back into 2D (H, W) Bayer mosaic for valid DNG output
+            hh, ww, _ = sharp_img.shape
+            bayer_out = np.zeros((hh * 2, ww * 2), dtype=np.float32)
+            bayer_out[0::2, 0::2] = sharp_img[:, :, 0]
+            bayer_out[0::2, 1::2] = sharp_img[:, :, 1]
+            bayer_out[1::2, 0::2] = sharp_img[:, :, 2]
+            bayer_out[1::2, 1::2] = sharp_img[:, :, 3]
+            final_output = np.round(np.clip(bayer_out, 0.0, 1.0) * white_lvl).astype(np.uint16)
         else:
-            float_img = input_img.astype(np.float32)
-            if float_img.max() > 1.0:
-                float_img /= float_img.max()
-            
-        print("Applying BM3D denoising...")
-        clean_img = apply_bm3d(float_img, noise_std_dev=0.04)
-        print("Applying Richardson-Lucy sharpening...")
-        sharp_img = apply_richardson_lucy(clean_img, iterations=15)
-        
-        # Scale back
-        if input_img.dtype == np.uint16:
-            final_output = (sharp_img * 65535.0).astype(np.uint16)
+            final_output = np.round(np.clip(sharp_img, 0.0, 1.0) * 65535.0).astype(np.uint16)
+
+        if is_cfa or args.dng:
+            output_path = f"{os.path.splitext(args.input)[0]}_enhanced.dng"
+            MonolithDNGWriter().save(final_output, output_path, is_cfa)
         else:
-            final_output = (sharp_img * 255.0).astype(np.uint8)
-            
-        out_ext = os.path.splitext(input_path)[1]
-        output_path = f"{os.path.splitext(input_path)[0]}_enhanced{out_ext}"
-        
-        skimage.io.imsave(output_path, final_output)
+            output_path = f"{os.path.splitext(args.input)[0]}_enhanced.tif"
+            if final_output.ndim == 3 and final_output.shape[2] > 3:
+                final_output = final_output[:, :, :3]
+            save_tiff(output_path, final_output)
+
         print(f"[*] Enhancement complete. Saved to {output_path}. Exiting.")
         sys.exit(0)
 
@@ -703,19 +752,16 @@ def main():
         f = args.test
         img, is_cfa = load_image(f)
         if img is not None:
+            if args.enhance:
+                print(f"[*] Running pre-CS enhancement ({'4-ch CFA' if is_cfa else '3-ch RGB'})...")
+                white_lvl = float(CAMERA_METADATA.get("white", 4095.0)) if CAMERA_METADATA else 4095.0
+                img = CS_Enhance.run_pre_cs_pipeline(img, is_cfa=is_cfa, settings=cfg, sensor_white=white_lvl)
+
             for l_val in [1e-6, 1e-5, 1e-4]:
                 for t_val in [0.001, 0.002, 0.005]:
-                    if not KEEP_RUNNING: break
+                    if not KEEP_RUNNING:
+                        break
                     res = process_full(img, is_cfa, cfg, l_val, t_val)
-                    
-                    # Apply enhancement if flagged
-                    if args.enhance:
-                        from image_enhancers import apply_bm3d, apply_richardson_lucy
-                        print(f"[*] Enhancing test output L{l_val}_T{t_val}...")
-                        res_float = res.astype(np.float32) / 65535.0
-                        res_float = apply_bm3d(res_float, noise_std_dev=0.04)
-                        res_float = apply_richardson_lucy(res_float, iterations=15)
-                        res = (res_float * 65535.0).astype(np.uint16)
 
                     if is_cfa or args.dng:
                         out = f"{os.path.splitext(f)[0]}_L{l_val}_T{t_val}.dng"
@@ -724,57 +770,41 @@ def main():
                         out = f"{os.path.splitext(f)[0]}_L{l_val}_T{t_val}.tif"
                         if len(res.shape) == 3 and res.shape[2] > 3:
                             res = res[:, :, :3]
-                        tifffile.imwrite(
-                            out, 
-                            res,
-                            bigtiff=True, 
-                            compression='zlib', 
-                            photometric='rgb'
-                        )
+                        save_tiff(out, res)
 
     # --- BATCH / SINGLE FILE MODE ---
     elif args.batch or args.input:
         path = args.batch if args.batch else args.input
         files = [os.path.join(path, f) for f in os.listdir(path) if f.lower().endswith(valid_exts)] if os.path.isdir(path) else [path]
         for f in files:
-            if not KEEP_RUNNING: break
-            
+            if not KEEP_RUNNING:
+                break
+
+            force_dng = args.dng
             img, is_cfa = load_image(f)
             if img is not None:
-                force_dng = args.dng 
                 out_ext = ".dng" if (is_cfa or force_dng) else ".tif"
                 out_path = f"{os.path.splitext(f)[0]}_irk_v58{out_ext}"
-                
-                if os.path.exists(out_path): 
+
+                if os.path.exists(out_path):
                     print(f"[SKIP] {out_path} already exists. Resuming queue.")
                     continue
-                
+
+                if args.enhance:
+                    print(f"[*] Running pre-CS enhancement ({'4-ch CFA' if is_cfa else '3-ch RGB'})...")
+                    white_lvl = float(CAMERA_METADATA.get("white", 4095.0)) if CAMERA_METADATA else 4095.0
+                    img = CS_Enhance.run_pre_cs_pipeline(img, is_cfa=is_cfa, settings=cfg, sensor_white=white_lvl)
+
                 print(f"[*] Processing {f}...")
                 res = process_full(img, is_cfa, cfg)
-                
-                # Apply enhancement to the upscaled result
-                if args.enhance:
-                    from image_enhancers import apply_bm3d, apply_richardson_lucy
-                    print("[*] Applying BM3D and Richardson-Lucy enhancements to upscaled image...")
-                    res_float = res.astype(np.float32) / 65535.0
-                    res_float = apply_bm3d(res_float, noise_std_dev=0.04)
-                    res_float = apply_richardson_lucy(res_float, iterations=15)
-                    res = (res_float * 65535.0).astype(np.uint16)
 
                 if is_cfa or force_dng:
                     MonolithDNGWriter().save(res, out_path, is_cfa)
                 else:
                     if len(res.shape) == 3 and res.shape[2] > 3:
                         res = res[:, :, :3]
-                    tifffile.imwrite(
-                        out_path, 
-                        res,
-                        bigtiff=True, 
-                        compression='zlib', 
-                        photometric='rgb'
-                    )
+                    save_tiff(out_path, res)
                 print(f"[*] Saved {out_path}")
-
 
 if __name__ == "__main__":
     main()
